@@ -468,12 +468,14 @@ void WifiManager::onWpaCLIReadyRead()
 
 void WifiManager::onWpaCLIFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
-    Q_UNUSED(exitCode);
-    Q_UNUSED(exitStatus);
     m_connectTimeoutTimer.stop();
-    // NOTE: do NOT clear m_wpaCLIBuffer here — readyRead has already consumed
-    // the process stdout into the buffer. Handlers read from m_wpaCLIBuffer
-    // and clear it themselves after use (see handleAddNetworkFinished).
+
+    // If the process was killed (e.g. new connect started), don't run state
+    // machine on stale output — the new connect owns the state machine now.
+    if (exitStatus != QProcess::NormalExit) {
+        m_wpaCLIBuffer.clear();
+        return;
+    }
 
     if (m_forgetMode) {
         // Only update UI to "Disconnected" if the forgotten network was the active one
@@ -604,6 +606,7 @@ void WifiManager::startSetSsid()
 void WifiManager::handleSetSsidFinished()
 {
     if (m_connectStep != 2) return;
+    m_wpaCLIBuffer.clear();
     m_connectStep = 3; // psk_or_key_mgmt
     startSetPskOrKeyMgmt();
 }
@@ -631,6 +634,7 @@ void WifiManager::startSetPskOrKeyMgmt()
 void WifiManager::handleSetPskOrKeyMgmtFinished()
 {
     if (m_connectStep != 3) return;
+    m_wpaCLIBuffer.clear();
     m_connectStep = 4; // save_config
     startSaveConfig();
 }
@@ -645,6 +649,7 @@ void WifiManager::startSaveConfig()
 void WifiManager::handleSaveConfigFinished()
 {
     if (m_connectStep != 4) return;
+    m_wpaCLIBuffer.clear();
     m_connectStep = 5; // select_network
     startSelectNetwork();
 }
@@ -660,6 +665,7 @@ void WifiManager::startSelectNetwork()
 void WifiManager::handleSelectNetworkFinished()
 {
     if (m_connectStep != 5) return;
+    m_wpaCLIBuffer.clear();
     // start status polling to wait for connection
     startStatusPolling();
     m_connectStep = 0; // done
@@ -669,9 +675,10 @@ void WifiManager::handleSelectNetworkFinished()
 
 void WifiManager::handleFallbackReconfigureFinished()
 {
-    if (m_connectStep != 7) return;
+    if (m_connectStep != 6) return;
     m_connectStep = 0; // done
-    qDebug() << "[WifiManager] handleFallbackReconfigureFinished -> done";
+    qDebug() << "[WifiManager] handleFallbackReconfigureFinished -> start polling";
+    startStatusPolling();
 }
 
 void WifiManager::handleFallbackReassociateFinished()

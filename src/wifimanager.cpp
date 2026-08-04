@@ -1,5 +1,6 @@
 #include "wifimanager.h"
 #include <QFile>
+#include <QFileInfo>
 #include <QTextStream>
 #include <QDebug>
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <QCryptographicHash>
 #include <QByteArray>
 #include <QMessageAuthenticationCode>
+#include <unistd.h> // for ::rename (POSIX)
 
 WifiManager::WifiManager(QObject *parent)
     : QObject(parent)
@@ -1164,18 +1166,49 @@ bool WifiManager::readWpaSupplicantConfig(const QString &path,
 bool WifiManager::writeWpaSupplicantConfig(const QString &path,
     const QStringList &headerLines, const QList<ConfigBlock> &networkBlocks)
 {
-    QFile confFile(path);
-    if (!confFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        qWarning() << "[WifiManager] Cannot write" << path;
+    // Atomic write: write to temp file in same dir, fsync, then rename.
+    // This prevents partial/corrupt config if power fails mid-write.
+    QFileInfo fi(path);
+    QString dir = fi.absolutePath();
+    QString tempPath = dir + "/.wpa_supplicant.conf.tmp";
+
+    QFile tempFile(tempPath);
+    if (!tempFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        qWarning() << "[WifiManager] Cannot write temp config" << tempPath;
         return false;
     }
 
-    QTextStream out(&confFile);
+    QTextStream out(&tempFile);
     for (const QString &h : headerLines)
         out << h << "\n";
     for (const ConfigBlock &cb : networkBlocks)
         out << cb.content;
-    confFile.close();
+
+    // Ensure data is on disk before rename — QFile::flush() calls fsync on POSIX
+    if (!tempFile.flush()) {
+        qWarning() << "[WifiManager] Failed to flush temp file";
+        tempFile.close();
+        QFile::remove(tempPath);
+        return false;
+    }
+    tempFile.close();
+
+    // Atomic rename (POSIX rename guarantees atomic overwrite on Linux)
+    if (::rename(tempPath.toUtf8().constData(), path.toUtf8().constData()) != 0) {
+        qWarning() << "[WifiManager] Atomic rename failed:" << tempPath << "->" << path;
+        QFile::remove(tempPath);
+        return false;
+    }
+
+    // Optional: fsync directory to persist rename (not strictly needed on ext4/overlayfs)
+    // but good practice for metadata durability.
+    QFile dirFile(dir);
+    if (dirFile.open(QIODevice::ReadOnly)) {
+        dirFile.flush(); // fsync directory
+        dirFile.close();
+    }
+
+    qDebug() << "[WifiManager] Atomic write ok:" << path;
     return true;
 }
 

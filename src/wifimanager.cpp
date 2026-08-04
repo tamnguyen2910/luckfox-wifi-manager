@@ -471,7 +471,9 @@ void WifiManager::onWpaCLIFinished(int exitCode, QProcess::ExitStatus exitStatus
     Q_UNUSED(exitCode);
     Q_UNUSED(exitStatus);
     m_connectTimeoutTimer.stop();
-    m_wpaCLIBuffer.clear();
+    // NOTE: do NOT clear m_wpaCLIBuffer here — readyRead has already consumed
+    // the process stdout into the buffer. Handlers read from m_wpaCLIBuffer
+    // and clear it themselves after use (see handleAddNetworkFinished).
 
     if (m_forgetMode) {
         // Only update UI to "Disconnected" if the forgotten network was the active one
@@ -568,11 +570,14 @@ void WifiManager::startAddNetwork()
 void WifiManager::handleAddNetworkFinished()
 {
     if (m_connectStep != 1) return;
-    
-    QString output = QString::fromUtf8(m_wpaCLIProcess->readAllStandardOutput()).trimmed();
+
+    // IMPORTANT: read from m_wpaCLIBuffer, NOT readAllStandardOutput() —
+    // readyRead has already consumed the process stdout into the buffer.
+    QString output = m_wpaCLIBuffer.trimmed();
+    m_wpaCLIBuffer.clear();
     bool ok;
     int netId = output.toInt(&ok);
-    
+
     if (!ok || netId < 0) {
         qDebug() << "[WifiManager] add_network failed:" << output << "— fallback reconfigure";
         m_connectTimeoutTimer.start(12000);
@@ -581,7 +586,7 @@ void WifiManager::handleAddNetworkFinished()
         m_connectStep = 7; // fallback_reassociate
         return;
     }
-    
+
     qDebug() << "[WifiManager] add_network ID:" << netId;
     m_pendingNetworkId = QString::number(netId);
     m_connectStep = 2; // set_ssid
@@ -673,7 +678,8 @@ void WifiManager::handleFallbackReassociateFinished()
 {
     if (m_connectStep != 7) return;
     m_connectStep = 0; // done
-    qDebug() << "[WifiManager] handleFallbackReassociateFinished -> done";
+    qDebug() << "[WifiManager] handleFallbackReassociateFinished -> start polling";
+    startStatusPolling();
 }
 
 // ==================== ASYNC CONNECTION CHECK ====================

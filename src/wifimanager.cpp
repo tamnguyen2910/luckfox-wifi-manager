@@ -1039,8 +1039,8 @@ void WifiManager::startAutoScan()
     if (!m_autoScanTimer) {
         m_autoScanTimer = new QTimer(this);
         connect(m_autoScanTimer, &QTimer::timeout, this, [this]() {
-            if (!m_isConnected && !m_isScanning) {
-                scan();
+            if (!m_isScanning) {
+                scan(); // Scan even when connected to refresh signal strength
             }
         });
     }

@@ -10,6 +10,12 @@ Makefile
 *.pro.user
 *.pro.user.*
 
+# Private board scripts (contain board IP/password — never push)
+scripts/deploy.sh
+scripts/deploy.exp
+scripts/run_app.exp
+scripts/run_on_board.exp
+
 # Editor/OS
 .vscode/
 .idea/

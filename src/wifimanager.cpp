@@ -907,6 +907,12 @@ QString WifiManager::readSavedPassword(const QString &ssid) const
                 // Hex PSK: psk=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
                 psk = line.mid(4);
             }
+        } else if (inTarget && isHexPskString(line)) {
+            // LEGACY FIX: older app versions wrote the hex PSK WITHOUT the
+            // "psk=" prefix (bare 64-hex line). Treat it as the PSK so saved
+            // networks from old configs still connect. Connect will rewrite
+            // the config with a proper psk= line, healing the file.
+            psk = line;
         }
     }
     confFile.close();

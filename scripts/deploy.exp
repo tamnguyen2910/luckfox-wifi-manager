@@ -1,0 +1,47 @@
+#!/usr/bin/expect -f
+# Deploy script - called from build.sh with binary path as argument
+
+set timeout 30
+
+set board_user "root"
+set board_pass "luckfox"
+set board_ip "192.168.1.3"
+set board_dest "/root"
+
+if {$argc < 1} {
+    puts "Usage: deploy.exp <local_binary_path>"
+    exit 1
+}
+set local_file [lindex $argv 0]
+
+# Kill old process
+spawn ssh -o StrictHostKeyChecking=no $board_user@$board_ip "pkill -9 -f wifi-manager 2>/dev/null; sleep 1; echo PREPOK"
+expect {
+    "password:" { send "$board_pass\r" }
+    timeout { puts "TIMEOUT"; exit 1 }
+    eof { }
+}
+expect { eof { } timeout { puts "TIMEOUT"; exit 1 } }
+
+# SCP binary
+spawn scp -o StrictHostKeyChecking=no $local_file $board_user@$board_ip:$board_dest/wifi-manager
+expect {
+    "password:" { send "$board_pass\r" }
+    timeout { puts "TIMEOUT"; exit 1 }
+}
+expect {
+    "100%" { }
+    eof { }
+    timeout { puts "TIMEOUT"; exit 1 }
+}
+sleep 1
+
+# Chmod
+spawn ssh -o StrictHostKeyChecking=no $board_user@$board_ip "chmod +x $board_dest/wifi-manager && echo DEPLOYDONE"
+expect {
+    "password:" { send "$board_pass\r" }
+    timeout { puts "TIMEOUT"; exit 1 }
+}
+expect { eof { } timeout { puts "TIMEOUT"; exit 1 } }
+
+puts "DEPLOY COMPLETE"

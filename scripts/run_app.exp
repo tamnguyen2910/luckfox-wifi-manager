@@ -1,0 +1,34 @@
+#!/usr/bin/expect -f
+set timeout 60
+
+# Kill old process
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@192.168.1.3 "pkill -9 -f wifi-manager 2>/dev/null; sleep 1"
+expect {
+    "password:" { send "luckfox\r"; exp_continue }
+    eof { }
+}
+
+# Write a start script on the board
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@192.168.1.3 "cat > /tmp/start_wifi.sh << 'EOFSCRIPT'
+export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0:size=800x480:mmsize=800x480
+export QT_QPA_FONTDIR=/usr/share/fonts/dejavu/
+export QT_SCALE_FACTOR=1.0
+export LD_LIBRARY_PATH=/usr/lib:/usr/lib/qt5/lib
+/root/wifi-manager > /tmp/wifiapp.log 2>&1 &
+sleep 5
+cat /tmp/wifiapp.log
+echo === DONE ===
+EOFSCRIPT
+chmod +x /tmp/start_wifi.sh"
+expect {
+    "password:" { send "luckfox\r"; exp_continue }
+    eof { }
+}
+
+# Run the script
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@192.168.1.3 /tmp/start_wifi.sh
+expect {
+    "password:" { send "luckfox\r"; exp_continue }
+    "=== DONE ===" { }
+    timeout { puts "TIMEOUT"; exit 1 }
+}

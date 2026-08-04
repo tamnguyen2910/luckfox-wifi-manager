@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+moc_*
+qrc_*
+Makefile
+.qmake.stash
+*.pro.user
+*.pro.user.*
+
+# Editor/OS
+.vscode/
+.idea/
+*~
+*.swp
+.DS_Store

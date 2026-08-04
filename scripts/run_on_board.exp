@@ -1,0 +1,25 @@
+#!/usr/bin/expect -f
+
+set timeout 40
+
+set board_user "root"
+set board_pass "luckfox"
+set board_ip "192.168.1.3"
+
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $board_user@$board_ip "
+    pkill -9 -f wifi-manager 2>/dev/null
+    sleep 1
+    export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0:size=800x480:mmsize=800x480
+    export QT_QPA_FONTDIR=/usr/share/fonts/dejavu/
+    export QT_SCALE_FACTOR=1.0
+    export LD_LIBRARY_PATH=/usr/lib:/usr/lib/qt5/lib
+    /root/wifi-manager > /tmp/wifiapp.log 2>&1 &
+    sleep 5
+    cat /tmp/wifiapp.log
+    echo '=== DONE ==='
+"
+expect {
+    "password:" { send "$board_pass\r"; exp_continue }
+    "=== DONE ===" { }
+    timeout { puts "TIMEOUT"; exit 1 }
+}

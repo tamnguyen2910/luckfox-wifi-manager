@@ -419,8 +419,8 @@ bool WifiManager::writeWpaSupplicantConfig(const QString &ssid, const QString &p
             // Normal password → convert to hex PSK via PBKDF2-SHA1
             QString hexPsk = generateHexPsk(ssid, password);
             if (!hexPsk.isEmpty()) {
-                // generateHexPsk returns "psk=hexstring", extract only "hexstring"
-                ns << "    " << hexPsk.mid(4) << "\n";
+                // generateHexPsk returns "psk=hexstring", write it FULLY (with psk= prefix)
+                ns << "    " << hexPsk << "\n";
                 qDebug() << "[WifiManager] Saved hex PSK for" << ssid;
             } else {
                 // Fallback to plaintext if PBKDF2 fails
@@ -428,7 +428,7 @@ bool WifiManager::writeWpaSupplicantConfig(const QString &ssid, const QString &p
                 ns << "    psk=\"" << password << "\"\n";
             }
         } else {
-            // Already hex PSK — write it directly (no quotes)
+            // Already hex PSK — write it directly (with psk= prefix)
             ns << "    psk=" << password << "\n";
             qDebug() << "[WifiManager] Saved hex PSK (reconnect) for" << ssid;
         }

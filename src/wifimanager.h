@@ -107,6 +107,7 @@ private:
     // Status polling
     void startStatusPolling();
     void stopStatusPolling();
+    void beginConnectPolling();
 
     // Saved networks
     void loadSavedNetworks();
@@ -149,6 +150,14 @@ private:
     QString m_pendingIpAddress;
     QString m_pendingSsid;
     int m_checkStep = 0; // 0=idle, 1=waiting ip, 2=waiting ssid
+
+    // DHCP renewal state (used when switching networks so the old AP's
+    // lease is never displayed as the new network's IP)
+    QProcess *m_dhcpProcess = nullptr;
+    bool m_renewalPending = false;
+    int m_renewalRetries = 0;
+    void startDhcpRenewal();
+    void handleDhcpRenewalFinished(int exitCode);
 
     // Buffer for wpa_cli output
     QString m_wpaCLIBuffer;

@@ -34,6 +34,7 @@ WifiManager::WifiManager(QObject *parent)
     , m_pendingSsid()
     , m_checkStep(0)
     , m_wpaCLIBuffer()
+    , m_dhcpProcess(nullptr)
     , m_autoScanTimer(nullptr)
 {
     // Initialize scan process (async, non-blocking)
@@ -80,18 +81,20 @@ WifiManager::WifiManager(QObject *parent)
                              return;
                          }
                          if (m_checkStep == 1) {
-                             // Parse IP from output
+                             // Parse IPv4 address from output using regex — robust against
+                             // format variations (with/without /prefix, extra whitespace,
+                             // inet6 lines). Old code split on spaces and assumed the
+                             // prefix was always present, breaking on different `ip`
+                             // output layouts.
                              QString output = QString::fromUtf8(m_ipCheckProcess->readAllStandardOutput());
-                             const QStringList lines = output.split('\n');
-                             for (const QString &line : lines) {
-                                 QString trimmed = line.trimmed();
-                                 if (trimmed.startsWith("inet ")) {
-                                     QStringList parts = trimmed.split(' ');
-                                     if (parts.size() >= 2) {
-                                         m_pendingIpAddress = parts.at(1).split('/').first();
-                                         break;
-                                     }
-                                 }
+                             static const QRegularExpression ipRe(
+                                 "\\binet\\s+(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})(?:/\\d{1,2})?");
+                             QRegularExpressionMatch match = ipRe.match(output);
+                             if (match.hasMatch()) {
+                                 m_pendingIpAddress = match.captured(1);
+                                 qDebug() << "[WifiManager] Parsed IP:" << m_pendingIpAddress;
+                             } else {
+                                 qDebug() << "[WifiManager] No IPv4 address found on wlan0";
                              }
                              m_checkStep = 2; // Move to waiting for SSID check
                              startSsidCheck();
@@ -138,6 +141,39 @@ WifiManager::WifiManager(QObject *parent)
                          }
                      });
 
+    // DHCP renewal process (async) — triggers fresh lease when switching networks
+    m_dhcpProcess = new QProcess(this);
+    m_dhcpProcess->setProcessChannelMode(QProcess::SeparateChannels);
+    QObject::connect(m_dhcpProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                     this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                         if (exitStatus != QProcess::NormalExit) {
+                             qDebug() << "[WifiManager] DHCP process killed, aborting renewal";
+                             m_renewalPending = false;
+                             return;
+                         }
+                         qDebug() << "[WifiManager] DHCP renewal finished, exit code:" << exitCode;
+                         if (exitCode == 0) {
+                             // Fresh lease acquired — safe to check the connection now.
+                             qDebug() << "[WifiManager] DHCP renewal OK, checking connection";
+                             m_renewalPending = false;
+                             m_renewalRetries = 0;
+                             startStatusPolling();
+                         } else {
+                             // No lease yet — retry up to 5 times
+                             if (m_renewalRetries < 5) {
+                                 qDebug() << "[WifiManager] DHCP renewal failed (exit" << exitCode
+                                          << "), retrying...";
+                                 m_renewalRetries++;
+                                 startDhcpRenewal();
+                             } else {
+                                 qDebug() << "[WifiManager] DHCP renewal gave up after 5 retries";
+                                 m_renewalPending = false;
+                                 m_renewalRetries = 0;
+                                 startStatusPolling(); // try anyway, maybe static IP
+                             }
+                         }
+                     });
+
     // Status polling timer
     m_statusPollTimer.setInterval(m_pollingInterval);
     QObject::connect(&m_statusPollTimer, &QTimer::timeout,
@@ -177,6 +213,8 @@ WifiManager::~WifiManager()
         m_ipCheckProcess->kill();
     if (m_ssidCheckProcess->state() != QProcess::NotRunning)
         m_ssidCheckProcess->kill();
+    if (m_dhcpProcess && m_dhcpProcess->state() != QProcess::NotRunning)
+        m_dhcpProcess->kill();
 }
 
 // ==================== SCAN ====================
@@ -515,16 +553,6 @@ void WifiManager::onWpaCLIFinished(int exitCode, QProcess::ExitStatus exitStatus
         return;
     }
 
-    // Regular connect (select_network) finished — trigger DHCP renewal so
-    // wlan0 gets a fresh IP from the new AP, then start polling
-    qDebug() << "[WifiManager] select_network sent, polling for connection...";
-
-    // Release old DHCP lease and request a new one from the new AP.
-    // udhcpc -n: exit if no lease  -q: quit after getting lease  -t 8: 8 retries
-    QProcess::startDetached("sh", QStringList() << "-c"
-        << "udhcpc -i wlan0 -n -q -t 8 2>/dev/null");
-
-    startStatusPolling();
 }
 
 // ==================== STATUS POLLING ====================
@@ -541,6 +569,16 @@ void WifiManager::stopStatusPolling()
     m_statusPollTimer.stop();
 }
 
+void WifiManager::beginConnectPolling()
+{
+    // Always renew DHCP first when switching networks — wpa_supplicant
+    // only handles 802.11, not DHCP. Without renewal, wlan0 keeps the
+    // OLD AP's lease and the SAME IP shows up for every network.
+    m_renewalRetries = 0;
+    qDebug() << "[WifiManager] beginConnectPolling: starting DHCP renewal";
+    startDhcpRenewal();
+}
+
 void WifiManager::onStatusPollingTimeout()
 {
     m_connectAttemptCounter++;
@@ -550,10 +588,25 @@ void WifiManager::onStatusPollingTimeout()
         stopStatusPolling();
         m_connectionStatus = "Connection failed";
         m_isConnecting = false;
+        m_renewalPending = false; // give up on DHCP too
         emit connectionStateChanged();
         qDebug() << "[WifiManager] Connection timeout after"
                  << m_maxConnectWaitSeconds << "seconds";
         return;
+    }
+
+    // If we're waiting on DHCP to assign a fresh IP (switched networks),
+    // run the renewal before checking — otherwise the old lease's IP
+    // would be reported for the new network.
+    if (m_renewalPending && m_dhcpProcess->state() == QProcess::NotRunning) {
+        qDebug() << "[WifiManager] Poll: DHCP renewal pending, retrying...";
+        if (m_renewalRetries++ < 5) {
+            m_renewalPending = false; // let handleDhcpRenewalFinished re-arm
+            startDhcpRenewal();
+            return;
+        }
+        qDebug() << "[WifiManager] Poll: DHCP renewal gave up after retries";
+        m_renewalPending = false;
     }
 
     // Trigger async check instead of blocking check
@@ -666,27 +719,28 @@ void WifiManager::handleSelectNetworkFinished()
 {
     if (m_connectStep != 5) return;
     m_wpaCLIBuffer.clear();
-    // start status polling to wait for connection
-    startStatusPolling();
     m_connectStep = 0; // done
     m_connectTimeoutTimer.start(12000);
-    qDebug() << "[WifiManager] handleSelectNetworkFinished -> start polling";
+    // Renew DHCP first, then poll for connection — this makes wlan0 get a
+    // fresh IP from the NEW AP instead of keeping the old network's lease.
+    qDebug() << "[WifiManager] handleSelectNetworkFinished -> beginConnectPolling";
+    beginConnectPolling();
 }
 
 void WifiManager::handleFallbackReconfigureFinished()
 {
     if (m_connectStep != 6) return;
     m_connectStep = 0; // done
-    qDebug() << "[WifiManager] handleFallbackReconfigureFinished -> start polling";
-    startStatusPolling();
+    qDebug() << "[WifiManager] handleFallbackReconfigureFinished -> beginConnectPolling";
+    beginConnectPolling();
 }
 
 void WifiManager::handleFallbackReassociateFinished()
 {
     if (m_connectStep != 7) return;
     m_connectStep = 0; // done
-    qDebug() << "[WifiManager] handleFallbackReassociateFinished -> start polling";
-    startStatusPolling();
+    qDebug() << "[WifiManager] handleFallbackReassociateFinished -> beginConnectPolling";
+    beginConnectPolling();
 }
 
 // ==================== ASYNC CONNECTION CHECK ====================
@@ -713,6 +767,32 @@ void WifiManager::startAsyncConnectionCheck()
     m_pendingIpAddress.clear();
     m_pendingSsid.clear();
     startIpCheck();
+}
+
+void WifiManager::startDhcpRenewal()
+{
+    if (m_dhcpProcess->state() != QProcess::NotRunning) {
+        qDebug() << "[WifiManager] DHCP renewal already running, skipping";
+        return;
+    }
+    m_renewalPending = true;
+    m_dhcpProcess->start("udhcpc", QStringList() << "-i" << "wlan0" << "-n" << "-q" << "-t" << "8");
+    qDebug() << "[WifiManager] Started udhcpc for wlan0";
+}
+
+void WifiManager::handleDhcpRenewalFinished(int exitCode)
+{
+    if (exitCode == 0) {
+        // Fresh lease acquired — safe to check the connection now. The IP
+        // on wlan0 is guaranteed to be the NEW AP's, not the old one's.
+        qDebug() << "[WifiManager] DHCP renewal OK, checking connection";
+        m_renewalPending = false;
+        startStatusPolling();
+    } else {
+        // No lease yet — leave m_renewalPending set so the poll loop retries.
+        qDebug() << "[WifiManager] DHCP renewal failed (exit" << exitCode
+                 << "), retrying on next poll";
+    }
 }
 
 void WifiManager::startIpCheck()
@@ -744,6 +824,7 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
             qDebug() << "[WifiManager] Still on old network:" << ssid << "— waiting for" << m_currentSSID;
             return;
         }
+
         bool wasConnected = m_isConnected;
         QString oldSSID = m_connectedSSID;
         QString oldIP   = m_connectedIP;

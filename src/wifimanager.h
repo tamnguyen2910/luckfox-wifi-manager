@@ -41,21 +41,6 @@ public:
     Q_INVOKABLE void startAutoScan();
     Q_INVOKABLE void stopAutoScan();
 
-private:
-    struct ConfigBlock {
-        QString content;
-        bool hasSSID;
-        QString ssid;
-    };
-
-    // Config file helpers
-    static bool readWpaSupplicantConfig(const QString &path,
-        QStringList &headerLines, QList<ConfigBlock> &networkBlocks,
-        const QString &ssidToSkip = QString());
-    static bool writeWpaSupplicantConfig(const QString &path,
-        const QStringList &headerLines, const QList<ConfigBlock> &networkBlocks);
-    static QString extractSSIDFromBlock(const QString &block);
-    static bool blockContainsSSID(const QString &block, const QString &ssid);
 signals:
     void isScanningChanged();
     void isConnectedChanged();
@@ -74,21 +59,59 @@ private slots:
     void onConnectTimeout();
 
 private:
+    struct ConfigBlock {
+        QString content;
+        bool hasSSID;
+        QString ssid;
+    };
+
+    // Config file helpers
+    static bool readWpaSupplicantConfig(const QString &path,
+        QStringList &headerLines, QList<ConfigBlock> &networkBlocks,
+        const QString &ssidToSkip = QString());
+    static bool writeWpaSupplicantConfig(const QString &path,
+        const QStringList &headerLines, const QList<ConfigBlock> &networkBlocks);
+    static QString extractSSIDFromBlock(const QString &block);
+    static bool blockContainsSSID(const QString &block, const QString &ssid);
+
+    // Scan parsing
     void parseWifiScanOutput(const QString &output);
-    void startStatusPolling();
-    void stopStatusPolling();
+
+    // Connection state machine helpers
+    void startAddNetwork();
+    void handleAddNetworkFinished();
+    void startSetSsid();
+    void handleSetSsidFinished();
+    void startSetPskOrKeyMgmt();
+    void handleSetPskOrKeyMgmtFinished();
+    void startSaveConfig();
+    void handleSaveConfigFinished();
+    void startSelectNetwork();
+    void handleSelectNetworkFinished();
+    void handleFallbackReconfigureFinished();
+    void handleFallbackReassociateFinished();
+
+    // Async connection check
     void startAsyncConnectionCheck();
     void startIpCheck();
-    void loadSavedNetworks();
-    QString readSavedPassword(const QString &ssid) const;
-    void updateSavedFlags();
     void startSsidCheck();
     void finalizeConnectionCheck(const QString &ipAddress, const QString &ssid);
+
+    // Helpers
     bool interfaceExists();
     bool writeWpaSupplicantConfig(const QString &ssid, const QString &password);
     static QString generateHexPsk(const QString &ssid, const QString &password);
     static bool isHexPskString(const QString &str);
     void updateDetailedStatus(const QString &wpaState);
+
+    // Status polling
+    void startStatusPolling();
+    void stopStatusPolling();
+
+    // Saved networks
+    void loadSavedNetworks();
+    QString readSavedPassword(const QString &ssid) const;
+    void updateSavedFlags();
 
     // UI-related members
     bool m_isScanning = false;
@@ -133,8 +156,13 @@ private:
     // Saved network SSIDs (loaded from /etc/wpa_supplicant.conf)
     QSet<QString> m_savedSSIDs;
 
-    // Cache of saved networks
+    // Auto scan timer
     QTimer *m_autoScanTimer = nullptr;
+
+    // Connection state machine
+    int m_connectStep = 0; // 0=idle, 1=add_network, 2=set_ssid, 3=set_psk_or_keymgmt, 4=save_config, 5=select_network, 6=fallback_reconfigure, 7=fallback_reassociate
+    QString m_pendingNetworkId;
+    QString m_pendingPassword;
 };
 
 #endif // WIFIMANAGER_H

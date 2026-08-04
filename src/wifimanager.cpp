@@ -329,7 +329,7 @@ void WifiManager::parseWifiScanOutput(const QString &output)
 
 void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
 {
-    // Kill both wpa_cli and scan process to avoid race conditions (fix C2)
+    // Kill both wpa_cli and scan process to avoid race conditions
     if (m_wpaCLIProcess->state() != QProcess::NotRunning)
         m_wpaCLIProcess->kill();
     if (m_wifiScanProcess->state() != QProcess::NotRunning)
@@ -342,7 +342,7 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
         return;
     }
 
-    // Validate password: trim and reject if empty (fix C5)
+    // Validate password: trim and reject if empty
     QString cleanPassword = password.trimmed();
     if (cleanPassword.isEmpty() && !password.isEmpty()) {
         qDebug() << "[WifiManager] Password contains only whitespace, treating as empty";
@@ -366,56 +366,12 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
     }
     loadSavedNetworks(); // refresh in-memory saved list
 
-    // Step 2: Use wpa_cli add_network/set_network/select_network API
-    QProcess addProc;
-    addProc.start("wpa_cli", QStringList() << "-i" << "wlan0" << "add_network");
-    addProc.waitForFinished(3000);
-    const QString idStr = QString::fromUtf8(addProc.readAllStandardOutput()).trimmed();
-    bool ok;
-    const int netId = idStr.toInt(&ok);
-
-    if (!ok || netId < 0) {
-        qDebug() << "[WifiManager] add_network failed:" << idStr << "— fallback reconfigure";
-        m_connectTimeoutTimer.start(12000);
-        // Use QProcess with timeout instead of blocking execute (fix C1)
-        m_wpaCLIProcess->start("sh", QStringList() << "-c"
-            << "wpa_cli -i wlan0 reconfigure && wpa_cli -i wlan0 reassociate");
-        return;
-    }
-
-    qDebug() << "[WifiManager] add_network ID:" << netId;
-    const QString id = QString::number(netId);
-
-    // Set SSID — pass value with double-quotes so wpa_supplicant parses it correctly.
-    // QProcess passes arguments via execvp (no shell), so we directly embed the quotes.
-    QProcess::execute("wpa_cli", QStringList() << "-i" << "wlan0"
-        << "set_network" << id << "ssid" << ('"' + ssid + '"'));
-    if (!cleanPassword.isEmpty()) {
-        // For hex PSK (64 hex chars), pass WITHOUT quotes so wpa_supplicant stores it as raw PSK.
-        // Otherwise, pass WITH quotes so wpa_supplicant hashes it as a passphrase.
-        if (isHexPskString(cleanPassword)) {
-            QProcess::execute("wpa_cli", QStringList() << "-i" << "wlan0"
-                << "set_network" << id << "psk" << cleanPassword);
-            qDebug() << "[WifiManager] Setting hex PSK (no quotes)";
-        } else {
-            QProcess::execute("wpa_cli", QStringList() << "-i" << "wlan0"
-                << "set_network" << id << "psk" << ('"' + cleanPassword + '"'));
-            qDebug() << "[WifiManager] Setting passphrase (quoted)";
-        }
-        QProcess::execute("wpa_cli", QStringList() << "-i" << "wlan0"
-            << "set_network" << id << "key_mgmt" << "WPA-PSK");
-    } else {
-        QProcess::execute("wpa_cli", QStringList() << "-i" << "wlan0"
-            << "set_network" << id << "key_mgmt" << "NONE");
-    }
-
-    // Persist the runtime config to file so the change survives wpa_supplicant restart
-    QProcess::execute("wpa_cli", QStringList() << "-i" << "wlan0" << "save_config");
-
-    // select_network: disable all other networks, begin connecting to this one
-    m_connectTimeoutTimer.start(12000);
-    m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
-        << "select_network" << id);
+    // Store password for async steps
+    m_pendingPassword = cleanPassword;
+    
+    // Start async connection state machine
+    m_connectStep = 1; // add_network
+    startAddNetwork();
 }
 
 void WifiManager::disconnectFromNetwork()
@@ -515,6 +471,7 @@ void WifiManager::onWpaCLIFinished(int exitCode, QProcess::ExitStatus exitStatus
     Q_UNUSED(exitCode);
     Q_UNUSED(exitStatus);
     m_connectTimeoutTimer.stop();
+    m_wpaCLIBuffer.clear();
 
     if (m_forgetMode) {
         // Only update UI to "Disconnected" if the forgotten network was the active one
@@ -528,10 +485,35 @@ void WifiManager::onWpaCLIFinished(int exitCode, QProcess::ExitStatus exitStatus
         return;
     }
 
+    // Connection state machine
+    if (m_connectStep == 1) {
+        handleAddNetworkFinished();
+        return;
+    } else if (m_connectStep == 2) {
+        handleSetSsidFinished();
+        return;
+    } else if (m_connectStep == 3) {
+        handleSetPskOrKeyMgmtFinished();
+        return;
+    } else if (m_connectStep == 4) {
+        handleSaveConfigFinished();
+        return;
+    } else if (m_connectStep == 5) {
+        handleSelectNetworkFinished();
+        return;
+    } else if (m_connectStep == 6 || m_connectStep == 7) {
+        // fallback_reconfigure or fallback_reassociate
+        if (m_connectStep == 6) {
+            handleFallbackReconfigureFinished();
+        } else {
+            handleFallbackReassociateFinished();
+        }
+        return;
+    }
+
     // Regular connect (select_network) finished — trigger DHCP renewal so
     // wlan0 gets a fresh IP from the new AP, then start polling
     qDebug() << "[WifiManager] select_network sent, polling for connection...";
-    m_wpaCLIBuffer.clear();
 
     // Release old DHCP lease and request a new one from the new AP.
     // udhcpc -n: exit if no lease  -q: quit after getting lease  -t 8: 8 retries
@@ -572,6 +554,126 @@ void WifiManager::onStatusPollingTimeout()
 
     // Trigger async check instead of blocking check
     startAsyncConnectionCheck();
+}
+
+// ==================== CONNECT STATE MACHINE ====================
+
+void WifiManager::startAddNetwork()
+{
+    if (m_connectStep != 1) return;
+    m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0" << "add_network");
+    qDebug() << "[WifiManager] startAddNetwork -> calling wpa_cli add_network";
+}
+
+void WifiManager::handleAddNetworkFinished()
+{
+    if (m_connectStep != 1) return;
+    
+    QString output = QString::fromUtf8(m_wpaCLIProcess->readAllStandardOutput()).trimmed();
+    bool ok;
+    int netId = output.toInt(&ok);
+    
+    if (!ok || netId < 0) {
+        qDebug() << "[WifiManager] add_network failed:" << output << "— fallback reconfigure";
+        m_connectTimeoutTimer.start(12000);
+        m_wpaCLIProcess->start("sh", QStringList() << "-c"
+            << "wpa_cli -i wlan0 reconfigure && wpa_cli -i wlan0 reassociate");
+        m_connectStep = 7; // fallback_reassociate
+        return;
+    }
+    
+    qDebug() << "[WifiManager] add_network ID:" << netId;
+    m_pendingNetworkId = QString::number(netId);
+    m_connectStep = 2; // set_ssid
+    startSetSsid();
+}
+
+void WifiManager::startSetSsid()
+{
+    if (m_connectStep != 2) return;
+    m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
+        << "set_network" << m_pendingNetworkId << "ssid" << ('"' + m_currentSSID + '"'));
+    qDebug() << "[WifiManager] startSetSsid -> set_network id ssid";
+}
+
+void WifiManager::handleSetSsidFinished()
+{
+    if (m_connectStep != 2) return;
+    m_connectStep = 3; // psk_or_key_mgmt
+    startSetPskOrKeyMgmt();
+}
+
+void WifiManager::startSetPskOrKeyMgmt()
+{
+    if (m_connectStep != 3) return;
+    
+    if (m_pendingPassword.isEmpty()) {
+        // Open network
+        m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
+            << "set_network" << m_pendingNetworkId << "key_mgmt" << "NONE");
+        qDebug() << "[WifiManager] startSetPskOrKeyMgmt -> set_network key_mgmt NONE";
+    } else if (isHexPskString(m_pendingPassword)) {
+        m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
+            << "set_network" << m_pendingNetworkId << "psk" << m_pendingPassword);
+        qDebug() << "[WifiManager] startSetPskOrKeyMgmt -> set_network hex PSK";
+    } else {
+        m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
+            << "set_network" << m_pendingNetworkId << "psk" << ('"' + m_pendingPassword + '"'));
+        qDebug() << "[WifiManager] startSetPskOrKeyMgmt -> set_network passphrase";
+    }
+}
+
+void WifiManager::handleSetPskOrKeyMgmtFinished()
+{
+    if (m_connectStep != 3) return;
+    m_connectStep = 4; // save_config
+    startSaveConfig();
+}
+
+void WifiManager::startSaveConfig()
+{
+    if (m_connectStep != 4) return;
+    m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0" << "save_config");
+    qDebug() << "[WifiManager] startSaveConfig -> save_config";
+}
+
+void WifiManager::handleSaveConfigFinished()
+{
+    if (m_connectStep != 4) return;
+    m_connectStep = 5; // select_network
+    startSelectNetwork();
+}
+
+void WifiManager::startSelectNetwork()
+{
+    if (m_connectStep != 5) return;
+    m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
+        << "select_network" << m_pendingNetworkId);
+    qDebug() << "[WifiManager] startSelectNetwork -> select_network";
+}
+
+void WifiManager::handleSelectNetworkFinished()
+{
+    if (m_connectStep != 5) return;
+    // start status polling to wait for connection
+    startStatusPolling();
+    m_connectStep = 0; // done
+    m_connectTimeoutTimer.start(12000);
+    qDebug() << "[WifiManager] handleSelectNetworkFinished -> start polling";
+}
+
+void WifiManager::handleFallbackReconfigureFinished()
+{
+    if (m_connectStep != 7) return;
+    m_connectStep = 0; // done
+    qDebug() << "[WifiManager] handleFallbackReconfigureFinished -> done";
+}
+
+void WifiManager::handleFallbackReassociateFinished()
+{
+    if (m_connectStep != 7) return;
+    m_connectStep = 0; // done
+    qDebug() << "[WifiManager] handleFallbackReassociateFinished -> done";
 }
 
 // ==================== ASYNC CONNECTION CHECK ====================

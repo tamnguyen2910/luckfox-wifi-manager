@@ -164,7 +164,6 @@ private:
     bool m_renewalPending = false;
     int m_renewalRetries = 0;
     void startDhcpRenewal();
-    void handleDhcpRenewalFinished(int exitCode);
 
     // Buffer for wpa_cli output
     QString m_wpaCLIBuffer;

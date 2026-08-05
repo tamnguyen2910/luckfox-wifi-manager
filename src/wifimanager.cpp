@@ -630,13 +630,10 @@ void WifiManager::onStatusPollingTimeout()
         return;
     }
 
-    // If we're waiting on DHCP to assign a fresh IP (switched networks),
-    // run the renewal before checking — otherwise the old lease's IP
-    // would be reported for the new network.
     if (m_renewalPending && m_dhcpProcess->state() == QProcess::NotRunning) {
         qDebug() << "[WifiManager] Poll: DHCP renewal pending, retrying...";
         if (m_renewalRetries++ < 5) {
-            m_renewalPending = false; // let handleDhcpRenewalFinished re-arm
+            m_renewalPending = false; // lambda will re-arm
             startDhcpRenewal();
             return;
         }
@@ -829,21 +826,6 @@ void WifiManager::startDhcpRenewal()
     m_renewalPending = true;
     m_dhcpProcess->start("udhcpc", QStringList() << "-i" << "wlan0" << "-n" << "-q" << "-t" << "8");
     qDebug() << "[WifiManager] Started udhcpc for wlan0";
-}
-
-void WifiManager::handleDhcpRenewalFinished(int exitCode)
-{
-    if (exitCode == 0) {
-        // Fresh lease acquired — safe to check the connection now. The IP
-        // on wlan0 is guaranteed to be the NEW AP's, not the old one's.
-        qDebug() << "[WifiManager] DHCP renewal OK, checking connection";
-        m_renewalPending = false;
-        startStatusPolling();
-    } else {
-        // No lease yet — leave m_renewalPending set so the poll loop retries.
-        qDebug() << "[WifiManager] DHCP renewal failed (exit" << exitCode
-                 << "), retrying on next poll";
-    }
 }
 
 void WifiManager::startIpCheck()

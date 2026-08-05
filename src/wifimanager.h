@@ -7,6 +7,7 @@
 #include <QProcess>
 #include <QMap>
 #include <QSet>
+#include <QMutex>
 
 class WifiManager : public QObject
 {
@@ -171,13 +172,13 @@ private:
     // Saved network SSIDs (loaded from /etc/wpa_supplicant.conf)
     QSet<QString> m_savedSSIDs;
 
-    // Auto scan timer
-    QTimer *m_autoScanTimer = nullptr;
-
     // Interface watchdog — poll wlan0 existence and wpa_cli health
     QTimer *m_interfaceWatchdog = nullptr;
     int m_watchdogDownCount = 0; // consecutive down checks (debounce)
     QString m_lastKnownSSID;     // SSID before interface loss, for auto-reconnect
+
+    // Config file access mutex (serialize read/write to /etc/wpa_supplicant.conf)
+    QMutex m_configMutex;
 
     // Connection state machine
     int m_connectStep = 0; // 0=idle, 1=add_network, 2=set_ssid, 3=set_psk_or_keymgmt, 4=save_config, 5=select_network, 6=fallback_reconfigure, 7=fallback_reassociate

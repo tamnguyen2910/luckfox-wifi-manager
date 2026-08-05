@@ -472,6 +472,9 @@ void WifiManager::disconnectFromNetwork()
 
 bool WifiManager::writeWpaSupplicantConfig(const QString &ssid, const QString &password)
 {
+    // Serialize config file access with concurrent forget operations
+    QMutexLocker locker(&m_configMutex);
+
     // Use the shared helper to read existing config, skipping the old block for this SSID
     QStringList headerLines;
     QList<ConfigBlock> networkBlocks;
@@ -929,6 +932,9 @@ void WifiManager::forgetNetwork(const QString &ssid)
     m_connectTimeoutTimer.stop();
     stopStatusPolling();
 
+    // Serialize config file access with concurrent connect operations
+    QMutexLocker locker(&m_configMutex);
+
     // Read current config, filter out the target network using shared helper
     QStringList headerLines;
     QList<ConfigBlock> networkBlocks;
@@ -990,6 +996,8 @@ void WifiManager::forgetNetwork(const QString &ssid)
 
 void WifiManager::loadSavedNetworks()
 {
+    QMutexLocker locker(&m_configMutex);
+
     m_savedSSIDs.clear();
     QFile confFile("/etc/wpa_supplicant.conf");
     if (!confFile.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -1022,6 +1030,8 @@ void WifiManager::loadSavedNetworks()
 
 QString WifiManager::readSavedPassword(const QString &ssid) const
 {
+    QMutexLocker locker(&m_configMutex);
+
     QFile confFile("/etc/wpa_supplicant.conf");
     if (!confFile.open(QIODevice::ReadOnly | QIODevice::Text))
         return QString();

@@ -178,7 +178,10 @@ private:
     QString m_lastKnownSSID;     // SSID before interface loss, for auto-reconnect
 
     // Config file access mutex (serialize read/write to /etc/wpa_supplicant.conf)
-    QMutex m_configMutex;
+    mutable QMutex m_configMutex;
+
+    // Auto scan timer
+    QTimer *m_autoScanTimer = nullptr;
 
     // Connection state machine
     int m_connectStep = 0; // 0=idle, 1=add_network, 2=set_ssid, 3=set_psk_or_keymgmt, 4=save_config, 5=select_network, 6=fallback_reconfigure, 7=fallback_reassociate

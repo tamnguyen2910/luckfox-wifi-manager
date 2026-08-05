@@ -58,6 +58,7 @@ private slots:
     void onStatusPollingTimeout();
     void onScanTimeout();
     void onConnectTimeout();
+    void onConnectTotalTimeout();
 
 private:
     struct ConfigBlock {
@@ -146,7 +147,8 @@ private:
 
     // Timeouts
     QTimer m_scanTimeoutTimer;
-    QTimer m_connectTimeoutTimer;
+    QTimer m_connectTimeoutTimer; // fallback path hang-guard (12s)
+    QTimer m_connectTotalTimer;   // global connect timeout (90s)
     bool m_isConnecting = false;
     bool m_forgetMode = false;
     QString m_ssidToForget;

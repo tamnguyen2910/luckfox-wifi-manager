@@ -191,6 +191,13 @@ WifiManager::WifiManager(QObject *parent)
     QObject::connect(&m_connectTimeoutTimer, &QTimer::timeout,
                      this, &WifiManager::onConnectTimeout);
 
+    // Global connect timeout (90s) — prevents stuck "Connecting..." forever
+    // if wpa_supplicant/ip/wpa_cli hangs. Covers entire state machine.
+    m_connectTotalTimer.setSingleShot(true);
+    m_connectTotalTimer.setInterval(90000);
+    QObject::connect(&m_connectTotalTimer, &QTimer::timeout,
+                     this, &WifiManager::onConnectTotalTimeout);
+
     // Check initial connection state (trigger async check)
     QTimer::singleShot(500, this, [this]() {
         if (interfaceExists()) {
@@ -242,6 +249,7 @@ WifiManager::~WifiManager()
     m_statusPollTimer.stop();
     m_scanTimeoutTimer.stop();
     m_connectTimeoutTimer.stop();
+    m_connectTotalTimer.stop();
     if (m_interfaceWatchdog)
         m_interfaceWatchdog->stop();
     if (m_wifiScanProcess->state() != QProcess::NotRunning)
@@ -424,6 +432,7 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
     m_isConnecting = false;
     m_isConnected = false;        // reset stale connected flag
     m_connectTimeoutTimer.stop(); // cancel any pending connect timeout
+    m_connectTotalTimer.stop();   // cancel any pending global connect timeout
     stopStatusPolling();
 
     if (!interfaceExists()) {
@@ -444,6 +453,7 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
     m_isConnecting = true;
     m_forgetMode = false;
     m_connectionStatus = "Connecting...";
+    m_connectTotalTimer.start(); // global 90s timeout for whole connect flow
     emit connectionStateChanged();
 
     qDebug() << "[WifiManager] Connecting to:" << ssid;
@@ -467,10 +477,9 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
 
 void WifiManager::disconnectFromNetwork()
 {
-    // Use wpa_cli to disconnect gracefully — preserves saved networks
-    QProcess discProc;
-    discProc.start("wpa_cli", QStringList() << "-i" << "wlan0" << "disconnect");
-    discProc.waitForFinished(3000);
+    // Use wpa_cli to disconnect gracefully — preserves saved networks.
+    // Async (startDetached) so the UI never freezes.
+    QProcess::startDetached("wpa_cli", QStringList() << "-i" << "wlan0" << "disconnect");
 
     // Release DHCP lease to avoid IP conflicts after reconnecting
     QProcess::startDetached("udhcpc", QStringList() << "-i" << "wlan0" << "-R");
@@ -484,6 +493,8 @@ void WifiManager::disconnectFromNetwork()
     emit connectionStateChanged();
 
     stopStatusPolling();
+    m_connectTimeoutTimer.stop();
+    m_connectTotalTimer.stop();
     qDebug() << "[WifiManager] Disconnected from current network";
 
     // Refresh scan results sau disconnect (fix B2)
@@ -895,6 +906,7 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
         emit connectionStateChanged();
         stopStatusPolling();
         m_connectTimeoutTimer.stop(); // cancel any pending connect timeout
+        m_connectTotalTimer.stop();   // connect succeeded, cancel global timeout
         // refresh scan results để cập nhật connected flag ngay lập tức (fix B1)
         updateSavedFlags();
         // cập nhật trong list ngay lập tức
@@ -919,6 +931,7 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
             if (wasConnected) emit isConnectedChanged();
             emit connectionStateChanged();
             m_connectTimeoutTimer.stop(); // no connect in flight, cancel timer
+            m_connectTotalTimer.stop();
         }
         // If connecting, keep polling until timeout
     }
@@ -938,6 +951,7 @@ void WifiManager::forgetNetwork(const QString &ssid)
     m_connectStep = 0;
     m_isConnecting = false;
     m_connectTimeoutTimer.stop();
+    m_connectTotalTimer.stop();
     stopStatusPolling();
 
     // Serialize config file access with concurrent connect operations
@@ -975,19 +989,18 @@ void WifiManager::forgetNetwork(const QString &ssid)
         emit connectedInfoChanged();
         emit connectionStateChanged();
         stopStatusPolling();
+        m_connectTimeoutTimer.stop();
+        m_connectTotalTimer.stop();
 
-        // Actually disconnect the WiFi interface (not just local state)
-        QProcess discProc;
-        discProc.start("wpa_cli", QStringList() << "-i" << "wlan0" << "disconnect");
-        discProc.waitForFinished(3000);
+        // Actually disconnect the WiFi interface (not just local state).
+        // Async (startDetached) so the UI never freezes.
+        QProcess::startDetached("wpa_cli", QStringList() << "-i" << "wlan0" << "disconnect");
     }
 
-    // Reconfigure wpa_supplicant with the updated config
-    // Use a LOCAL synchronous process to avoid race with async state machine
-    QProcess reconfProc;
-    reconfProc.start("wpa_cli", QStringList() << "-i" << "wlan0" << "reconfigure");
-    reconfProc.waitForFinished(3000);
-    qDebug() << "[WifiManager] Reconfigure output:" << QString::fromUtf8(reconfProc.readAllStandardOutput()).trimmed();
+    // Reconfigure wpa_supplicant with the updated config.
+    // Async (startDetached) — no UI freeze, no shared-buffer race with the
+    // async state machine (wpa_cli is a separate daemon, not m_wpaCLIProcess).
+    QProcess::startDetached("wpa_cli", QStringList() << "-i" << "wlan0" << "reconfigure");
 
     qDebug() << "[WifiManager] Forgot network:" << ssid;
 
@@ -1232,6 +1245,7 @@ void WifiManager::onInterfaceWatchdogTimeout()
         emit connectionStateChanged();
         stopStatusPolling();
         m_connectTimeoutTimer.stop(); // cancel any pending connect timeout
+        m_connectTotalTimer.stop();   // interface lost, abort connect
         // Kill any in-flight wpa_cli
         if (m_wpaCLIProcess->state() != QProcess::NotRunning)
             m_wpaCLIProcess->kill();
@@ -1272,6 +1286,36 @@ void WifiManager::onConnectTimeout()
         emit isConnectedChanged();
         emit connectedInfoChanged();
         stopStatusPolling(); // also stop polling
+        m_connectTotalTimer.stop(); // cancel global timeout too
+    }
+}
+
+void WifiManager::onConnectTotalTimeout()
+{
+    if (m_isConnecting) {
+        qDebug() << "[WifiManager] Global connect timeout after 90s";
+        m_connectionStatus = "Connection failed";
+        m_isConnecting = false;
+        m_isConnected = false;
+        m_connectedSSID.clear();
+        m_connectedIP.clear();
+        m_renewalPending = false;
+        m_connectStep = 0;
+        m_wpaCLIBuffer.clear();
+        emit connectionStateChanged();
+        emit isConnectedChanged();
+        emit connectedInfoChanged();
+        stopStatusPolling();
+        // Kill any hung wpa_cli / dhcp / check processes
+        if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+            m_wpaCLIProcess->kill();
+        if (m_dhcpProcess->state() != QProcess::NotRunning)
+            m_dhcpProcess->kill();
+        if (m_ipCheckProcess->state() != QProcess::NotRunning)
+            m_ipCheckProcess->kill();
+        if (m_ssidCheckProcess->state() != QProcess::NotRunning)
+            m_ssidCheckProcess->kill();
+        m_connectTimeoutTimer.stop();
     }
 }
 

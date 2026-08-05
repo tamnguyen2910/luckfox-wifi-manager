@@ -1004,8 +1004,11 @@ void WifiManager::forgetNetwork(const QString &ssid)
 
 void WifiManager::loadSavedNetworks()
 {
-    QMutexLocker locker(&m_configMutex);
-
+    // NOTE: no QMutexLocker here — forgetNetwork() holds m_configMutex while
+    // calling this (via connectToNetwork's writeWpaSupplicantConfig too). A
+    // nested lock of the same non-recursive QMutex on one thread would deadlock.
+    // The whole app runs on a single thread (Qt event loop), so the mutex is
+    // only meant to serialize file access, not for thread safety.
     m_savedSSIDs.clear();
     QFile confFile("/etc/wpa_supplicant.conf");
     if (!confFile.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -1038,8 +1041,8 @@ void WifiManager::loadSavedNetworks()
 
 QString WifiManager::readSavedPassword(const QString &ssid) const
 {
-    QMutexLocker locker(&m_configMutex);
-
+    // No QMutexLocker here — see loadSavedNetworks() comment. Single-threaded,
+    // and connectSaved() may be called from within a locked context.
     QFile confFile("/etc/wpa_supplicant.conf");
     if (!confFile.open(QIODevice::ReadOnly | QIODevice::Text))
         return QString();

@@ -201,6 +201,27 @@ WifiManager::WifiManager(QObject *parent)
     // Load saved networks from config for remember-password feature
     loadSavedNetworks();
 
+    // Auto-reconnect to preferred saved network on startup.
+    // Priority: "Tamnguyen" if present in saved networks.
+    // Wait a bit for interface to be ready, then attempt connection.
+    QTimer::singleShot(1000, this, [this]() {
+        // Skip if already connected (wpa_supplicant may have auto-associated
+        // from update_config on boot).
+        if (m_isConnected) {
+            qDebug() << "[WifiManager] Startup: already connected, skipping auto-reconnect";
+            return;
+        }
+        if (m_savedSSIDs.contains("Tamnguyen")) {
+            qDebug() << "[WifiManager] Startup: auto-reconnecting to preferred network" << "Tamnguyen";
+            connectSaved("Tamnguyen");
+        } else if (!m_savedSSIDs.isEmpty()) {
+            // Fallback: connect to the first saved network if Tamnguyen not found
+            QString fallback = *m_savedSSIDs.begin();
+            qDebug() << "[WifiManager] Startup: auto-reconnecting to fallback saved network" << fallback;
+            connectSaved(fallback);
+        }
+    });
+
     // Watchdog: poll wlan0 existence every 2s.
     // With debounce of 2 consecutive down checks, a down lasting >= 5s
     // is detected (~4s), showing "Interface lost" and enabling auto-reconnect.

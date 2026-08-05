@@ -755,7 +755,10 @@ void WifiManager::handleSelectNetworkFinished()
     if (m_connectStep != 5) return;
     m_wpaCLIBuffer.clear();
     m_connectStep = 0; // done
-    m_connectTimeoutTimer.start(12000);
+    // NOTE: No 12s connect-timeout timer here. The DHCP renewal + status
+    // polling can legitimately take up to 25s (m_maxConnectWaitSeconds).
+    // A shorter timer here would fire a false "Connection timeout" while
+    // a slow-but-successful connect is still in progress.
     // Renew DHCP first, then poll for connection — this makes wlan0 get a
     // fresh IP from the NEW AP instead of keeping the old network's lease.
     qDebug() << "[WifiManager] handleSelectNetworkFinished -> beginConnectPolling";
@@ -888,6 +891,7 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
         }
         emit connectionStateChanged();
         stopStatusPolling();
+        m_connectTimeoutTimer.stop(); // cancel any pending connect timeout
         // refresh scan results để cập nhật connected flag ngay lập tức (fix B1)
         updateSavedFlags();
         // cập nhật trong list ngay lập tức
@@ -911,6 +915,7 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
             m_connectionStatus = "Disconnected";
             if (wasConnected) emit isConnectedChanged();
             emit connectionStateChanged();
+            m_connectTimeoutTimer.stop(); // no connect in flight, cancel timer
         }
         // If connecting, keep polling until timeout
     }
@@ -1220,6 +1225,7 @@ void WifiManager::onInterfaceWatchdogTimeout()
         emit connectedInfoChanged();
         emit connectionStateChanged();
         stopStatusPolling();
+        m_connectTimeoutTimer.stop(); // cancel any pending connect timeout
         // Kill any in-flight wpa_cli
         if (m_wpaCLIProcess->state() != QProcess::NotRunning)
             m_wpaCLIProcess->kill();

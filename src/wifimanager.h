@@ -99,6 +99,7 @@ private:
 
     // Helpers
     bool interfaceExists();
+    bool interfaceIsUp();
     bool writeWpaSupplicantConfig(const QString &ssid, const QString &password);
     static QString generateHexPsk(const QString &ssid, const QString &password);
     static bool isHexPskString(const QString &str);
@@ -108,6 +109,11 @@ private:
     void startStatusPolling();
     void stopStatusPolling();
     void beginConnectPolling();
+
+    // Interface watchdog
+    void startInterfaceWatchdog();
+    void stopInterfaceWatchdog();
+    void onInterfaceWatchdogTimeout();
 
     // Saved networks
     void loadSavedNetworks();
@@ -167,6 +173,11 @@ private:
 
     // Auto scan timer
     QTimer *m_autoScanTimer = nullptr;
+
+    // Interface watchdog — poll wlan0 existence and wpa_cli health
+    QTimer *m_interfaceWatchdog = nullptr;
+    int m_watchdogDownCount = 0; // consecutive down checks (debounce)
+    QString m_lastKnownSSID;     // SSID before interface loss, for auto-reconnect
 
     // Connection state machine
     int m_connectStep = 0; // 0=idle, 1=add_network, 2=set_ssid, 3=set_psk_or_keymgmt, 4=save_config, 5=select_network, 6=fallback_reconfigure, 7=fallback_reassociate

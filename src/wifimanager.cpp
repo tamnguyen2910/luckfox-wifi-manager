@@ -200,6 +200,20 @@ WifiManager::WifiManager(QObject *parent)
 
     // Load saved networks from config for remember-password feature
     loadSavedNetworks();
+
+    // Watchdog: poll wlan0 existence every 2s.
+    // With debounce of 2 consecutive down checks, a down lasting >= 5s
+    // is detected (~4s), showing "Interface lost" and enabling auto-reconnect.
+    m_interfaceWatchdog = new QTimer(this);
+    m_interfaceWatchdog->setInterval(2000);
+    QObject::connect(m_interfaceWatchdog, &QTimer::timeout,
+                     this, &WifiManager::onInterfaceWatchdogTimeout);
+    m_interfaceWatchdog->start();
+
+    // Periodic auto-scan so the WiFi list always refreshes (even when
+    // connected, and after auto-reconnect). Guards inside the timer
+    // callback skip while a connect/DHCP is in progress.
+    startAutoScan();
 }
 
 WifiManager::~WifiManager()
@@ -207,6 +221,8 @@ WifiManager::~WifiManager()
     m_statusPollTimer.stop();
     m_scanTimeoutTimer.stop();
     m_connectTimeoutTimer.stop();
+    if (m_interfaceWatchdog)
+        m_interfaceWatchdog->stop();
     if (m_wifiScanProcess->state() != QProcess::NotRunning)
         m_wifiScanProcess->kill();
     if (m_wpaCLIProcess->state() != QProcess::NotRunning)
@@ -229,6 +245,13 @@ void WifiManager::scan()
     if (!interfaceExists()) {
         m_connectionStatus = "Failed: wlan0 not found";
         emit connectionStateChanged();
+        return;
+    }
+
+    if (!interfaceIsUp()) {
+        m_connectionStatus = "Failed: wlan0 is down";
+        emit connectionStateChanged();
+        qDebug() << "[WifiManager] Scan aborted: wlan0 is down";
         return;
     }
 
@@ -369,11 +392,18 @@ void WifiManager::parseWifiScanOutput(const QString &output)
 
 void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
 {
-    // Kill both wpa_cli and scan process to avoid race conditions
+    // Abort any in-flight connect/forget state machine first.
+    // Kill both wpa_cli and scan process to avoid race conditions.
     if (m_wpaCLIProcess->state() != QProcess::NotRunning)
         m_wpaCLIProcess->kill();
     if (m_wifiScanProcess->state() != QProcess::NotRunning)
         m_wifiScanProcess->kill();
+    m_wpaCLIBuffer.clear();       // discard stale output from killed process
+    m_connectStep = 0;            // reset state machine
+    m_isConnecting = false;
+    m_isConnected = false;        // reset stale connected flag
+    m_connectTimeoutTimer.stop(); // cancel any pending connect timeout
+    stopStatusPolling();
 
     if (!interfaceExists()) {
         m_connectionStatus = "Failed: wlan0 not found";
@@ -753,6 +783,19 @@ bool WifiManager::interfaceExists()
     return ifaceFile.exists();
 }
 
+bool WifiManager::interfaceIsUp()
+{
+    // operstate: "up" / "down" / "unknown" / "dormant"
+    // WiFi is frequently "dormant" while waiting for carrier/associate —
+    // that's NOT down, it's a normal transient state. Only "down" is real.
+    QFile operFile("/sys/class/net/wlan0/operstate");
+    if (!operFile.open(QIODevice::ReadOnly | QIODevice::Text))
+        return false;
+    QString state = QString::fromUtf8(operFile.readAll()).trimmed();
+    operFile.close();
+    return (state == "up" || state == "unknown" || state == "dormant");
+}
+
 void WifiManager::startAsyncConnectionCheck()
 {
     if (!interfaceExists()) {
@@ -877,6 +920,15 @@ void WifiManager::forgetNetwork(const QString &ssid)
     m_forgetMode = true;
     m_ssidToForget = ssid;
 
+    // Abort any in-flight connect/forget state machine first
+    if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+        m_wpaCLIProcess->kill();
+    m_wpaCLIBuffer.clear();
+    m_connectStep = 0;
+    m_isConnecting = false;
+    m_connectTimeoutTimer.stop();
+    stopStatusPolling();
+
     // Read current config, filter out the target network using shared helper
     QStringList headerLines;
     QList<ConfigBlock> networkBlocks;
@@ -884,6 +936,8 @@ void WifiManager::forgetNetwork(const QString &ssid)
         qWarning() << "[WifiManager] ERROR: Cannot read wpa_supplicant.conf during forget";
         m_connectionStatus = "Failed: Cannot read config";
         emit connectionStateChanged();
+        m_forgetMode = false;
+        m_ssidToForget.clear();
         return;
     }
 
@@ -892,6 +946,8 @@ void WifiManager::forgetNetwork(const QString &ssid)
         qWarning() << "[WifiManager] ERROR: Cannot write wpa_supplicant.conf during forget";
         m_connectionStatus = "Failed: Cannot write config";
         emit connectionStateChanged();
+        m_forgetMode = false;
+        m_ssidToForget.clear();
         return;
     }
 
@@ -913,7 +969,11 @@ void WifiManager::forgetNetwork(const QString &ssid)
     }
 
     // Reconfigure wpa_supplicant with the updated config
-    m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0" << "reconfigure");
+    // Use a LOCAL synchronous process to avoid race with async state machine
+    QProcess reconfProc;
+    reconfProc.start("wpa_cli", QStringList() << "-i" << "wlan0" << "reconfigure");
+    reconfProc.waitForFinished(3000);
+    qDebug() << "[WifiManager] Reconfigure output:" << QString::fromUtf8(reconfProc.readAllStandardOutput()).trimmed();
 
     qDebug() << "[WifiManager] Forgot network:" << ssid;
 
@@ -921,6 +981,9 @@ void WifiManager::forgetNetwork(const QString &ssid)
     loadSavedNetworks();
     updateSavedFlags();
     emit scanResultsChanged(); // refresh list view ngay lập tức (fix B2)
+
+    m_forgetMode = false;
+    m_ssidToForget.clear();
 }
 
 // ==================== SAVED NETWORKS ====================
@@ -1039,12 +1102,17 @@ void WifiManager::startAutoScan()
     if (!m_autoScanTimer) {
         m_autoScanTimer = new QTimer(this);
         connect(m_autoScanTimer, &QTimer::timeout, this, [this]() {
-            if (!m_isScanning) {
-                scan(); // Scan even when connected to refresh signal strength
+            // Skip auto-scan while connecting or doing DHCP renewal —
+            // scanning during those operations would disturb wpa_supplicant
+            // and could cause connection failures.
+            if (m_isConnecting || m_renewalPending || m_isScanning) {
+                qDebug() << "[WifiManager] Auto-scan skipped: busy";
+                return;
             }
+            scan();
         });
     }
-    m_autoScanTimer->start(10000);
+    m_autoScanTimer->start(60000); // 60 seconds
     // Initial scan
     scan();
 }
@@ -1053,6 +1121,104 @@ void WifiManager::stopAutoScan()
 {
     if (m_autoScanTimer) {
         m_autoScanTimer->stop();
+    }
+}
+
+// ==================== INTERFACE WATCHDOG ====================
+
+void WifiManager::startInterfaceWatchdog()
+{
+    if (!m_interfaceWatchdog) {
+        m_interfaceWatchdog = new QTimer(this);
+        m_interfaceWatchdog->setInterval(5000);
+        QObject::connect(m_interfaceWatchdog, &QTimer::timeout,
+                         this, &WifiManager::onInterfaceWatchdogTimeout);
+    }
+    m_interfaceWatchdog->start();
+}
+
+void WifiManager::stopInterfaceWatchdog()
+{
+    if (m_interfaceWatchdog)
+        m_interfaceWatchdog->stop();
+}
+
+void WifiManager::onInterfaceWatchdogTimeout()
+{
+    bool ifacePresent = interfaceExists();
+    bool ifaceUp = ifacePresent && interfaceIsUp();
+
+    if (ifacePresent && ifaceUp) {
+        // Interface is healthy. If it previously went down (debounced),
+        // auto-reconnect to the last known network if it's saved.
+        bool wasDown = (m_watchdogDownCount >= 2);
+        m_watchdogDownCount = 0; // healthy, reset debounce
+
+        if (wasDown && !m_isConnecting) {
+            if (!m_lastKnownSSID.isEmpty()) {
+                QString ssid = m_lastKnownSSID;
+                qDebug() << "[WifiManager] Watchdog: wlan0 back up, auto-reconnecting to"
+                         << ssid;
+                // Clear immediately to prevent re-trigger on next tick
+                m_lastKnownSSID.clear();
+                if (m_savedSSIDs.contains(ssid))
+                    connectSaved(ssid);
+                else
+                    scan();
+                return;
+            }
+            qDebug() << "[WifiManager] Watchdog: wlan0 back up, triggering scan";
+            scan();
+        }
+        return;
+    }
+
+    // Interface missing or operstate down.
+    //
+    // Do NOT treat as lost while a connect/DHCP renewal is in progress —
+    // wlan0 legitimately drops to "down" briefly when switching APs, and
+    // udhcpc may be mid-renewal. The connect state machine owns wlan0
+    // during that window; the watchdog must not fight it.
+    if (m_isConnecting || m_renewalPending) {
+        m_watchdogDownCount = 0; // reset debounce; connect flow owns state
+        qDebug() << "[WifiManager] Watchdog: wlan0 down but connecting, skipping cleanup";
+        return;
+    }
+
+    // Debounce: require 3 consecutive down checks (~6s) so a momentary
+    // reassociate blip doesn't trigger a false "Interface lost". With 2s
+    // interval, 3 checks = 6s (consistent with ~5s sleep test).
+    if (++m_watchdogDownCount < 3) {
+        qDebug() << "[WifiManager] Watchdog: wlan0 down (check"
+                 << m_watchdogDownCount << ")";
+        return;
+    }
+
+    qDebug() << "[WifiManager] Watchdog: wlan0"
+             << (ifacePresent ? "is down" : "disappeared");
+
+    if (m_isConnected) {
+        // Remember which network we were on so we can auto-reconnect later
+        m_lastKnownSSID = m_connectedSSID;
+        qDebug() << "[WifiManager] Cleaning up lost connection state (was on"
+                 << m_lastKnownSSID << ")";
+        m_isConnected = false;
+        m_connectedSSID.clear();
+        m_connectedIP.clear();
+        m_connectionStatus = "Interface lost";
+        emit isConnectedChanged();
+        emit connectedInfoChanged();
+        emit connectionStateChanged();
+        stopStatusPolling();
+        // Kill any in-flight wpa_cli
+        if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+            m_wpaCLIProcess->kill();
+    }
+
+    // Clear stale scan results so UI doesn't show phantom networks
+    if (!m_scanResults.isEmpty()) {
+        m_scanResults.clear();
+        emit scanResultsChanged();
     }
 }
 

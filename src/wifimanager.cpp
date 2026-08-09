@@ -647,8 +647,8 @@ void WifiManager::parseWifiScanOutput(const QString &output)
         }
         // Signal strength
         else if (trimmed.startsWith("signal: ")) {
-            QString signalStr = trimmed.mid(8); // bỏ "signal: "
-            QRegularExpression re("-?\\d+(\\.\\d+)?"); // số âm nguyên hoặc thập phân
+            QString signalStr = trimmed.mid(8); // strip the "signal: " prefix
+            QRegularExpression re("-?\\d+(\\.\\d+)?"); // signed integer or decimal
             QRegularExpressionMatch match = re.match(signalStr);
             if (match.hasMatch()) {
                 bool ok;
@@ -842,7 +842,7 @@ void WifiManager::disconnectFromNetwork()
     m_connectTotalTimer.stop();
     qDebug() << "[WifiManager] Disconnected from current network";
 
-    // Refresh scan results sau disconnect (fix B2)
+    // Refresh scan results after disconnect (fix B2)
     updateSavedFlags();
     emit scanResultsChanged();
 }
@@ -1446,9 +1446,9 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
             }
         }
 
-        // refresh scan results để cập nhật connected flag ngay lập tức (fix B1)
+        // refresh scan results to update the connected flag immediately (fix B1)
         updateSavedFlags();
-        // cập nhật trong list ngay lập tức
+        // update the list immediately
         emit scanResultsChanged();
         // Connect finished — resume auto-scan (was paused during connect)
         resumeAutoScan();
@@ -1549,7 +1549,7 @@ void WifiManager::forgetNetwork(const QString &ssid)
     // Refresh saved-network list and UI flags
     loadSavedNetworks();
     updateSavedFlags();
-    emit scanResultsChanged(); // refresh list view ngay lập tức (fix B2)
+    emit scanResultsChanged(); // refresh list view immediately (fix B2)
 
     m_forgetMode = false;
     m_ssidToForget.clear();

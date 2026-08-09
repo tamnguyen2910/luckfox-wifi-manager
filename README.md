@@ -1,144 +1,204 @@
-# luckfox-wifi-manager
+# 📶 Luckfox WiFi Manager
 
-WiFi Manager for **Luckfox Pico Ultra W** (RV1106, ARM Cortex-A7) running Buildroot Linux.
+Qt5/QML WiFi manager for **Luckfox Pico Ultra W** (RV1106, ARM Cortex-A7, 800×480 RGB LCD) — clean UI, `wpa_cli` + `iw` + `udhcpc` via async QProcess, cross-compiled with Buildroot SDK.
 
-Qt5/QML frontend + C++ backend; `linuxfb` display at 800×480. The app uses `iw dev wlan0 scan` for WiFi scan, `wpa_cli` for connection, and `udhcpc` for DHCP renewals — all non-blocking via async `QProcess` in the Qt event loop.
+![Platform](https://img.shields.io/badge/platform-Luckfox%20Pico%20Ultra%20W-blue)
+![Qt](https://img.shields.io/badge/Qt-5.15.8-green)
+![Build](https://img.shields.io/badge/build-qmake%20%2B%20Buildroot-orange)
+![Backend](https://img.shields.io/badge/backend-wpa_cli%20%2B%20iw%20%2B%20udhcpc-1DB954)
 
-## Quick Start
+---
 
-```bash
-# 1. Copy board config (credentials are git-ignored — never pushed)
-cp config/board.env.example config/board.env
-# Edit config/board.env with your board's actual IP, user, password
+## ✨ Features
 
-# 2. Build
-./scripts/build.sh          # build + deploy to board in one step
+- 🔍 **Scan & Connect** — `iw dev wlan0 scan` + `wpa_cli` multi-step (add_network → set_network → save_config → select_network)
+- 🔐 **Hex PSK storage** — PBKDF2-SHA1 implemented in-app; passwords never stored as plaintext in `/etc/wpa_supplicant.conf`
+- ⚡ **Auto-connect strongest** — on first launch, scans and connects to the saved network with the best dBm
+- 📋 **Specific error messages** — distinguishes:
+  - `"Wrong password — authentication failed with <ssid>"` (4-way handshake mismatch)
+  - `"Cannot find <ssid> — network not in range"` (AP unreachable)
+  - `"Cannot connect to <ssid> — association failed"` (association timeout)
+  - `"Cannot connect to <ssid> — connection timed out"` (generic timeout)
+- 🔄 **Auto-rollback** — on failed connect, immediately reconnects to the previous saved network (or strongest saved if no prior connect)
+- 🛡 **Self-healing wlan0** — interface watchdog detects `NO-CARRIER` / wpa_supplicant death:
+  - Removes stale `/var/run/wpa_supplicant/wlan0` socket
+  - Restarts `wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf`
+  - Brings `wlan0` back up automatically
+- 🗂 **Network management** — `forget <ssid>` removes network from config (keeps others); `disconnect` clean disconnect
+- 🧪 **Headless testing** — inject commands via `/tmp/wifi_sim_cmd` over SSH:
+  ```bash
+  ssh root@<board-ip> "echo 'scan' > /tmp/wifi_sim_cmd"
+  ssh root@<board-ip> "echo 'connectsaved Tamnguyen' > /tmp/wifi_sim_cmd"
+  ```
+- 🎨 **Touch UI** — 800×480 `linuxfb`, on-screen virtual keyboard, signal strength bars (0–4), weak-signal warning (< -75 dBm)
+- ⏱ **Adaptive auto-scan** — 30s–180s interval based on signal stability
+- 🧵 **Async everywhere** — all `iw`/`wpa_cli`/`udhcpc` calls via `QProcess` (non-blocking Qt event loop)
 
-# 3. Run on the board
-./scripts/run_app.exp config/board.env   # starts app + prints startup log
+## 🏗️ Architecture
+
+```
+┌────────────────────────────────────────────┐
+│  QML UI (Qt Quick Controls 2.12)          │
+│  - network list (SSID, dBm, secured flag) │
+│  - password dialog + virtual keyboard     │
+│  - error banner (transient, lastError)    │
+└──────────────────┬─────────────────────────┘
+                   │ Q_PROPERTY / Q_INVOKABLE
+┌──────────────────▼─────────────────────────┐
+│  C++ Backend (WifiManager)                 │
+│  - scan: iw dev wlan0 scan (async)         │
+│  - connect: wpa_cli state machine (5 steps)│
+│  - status polling: wpa_cli status (2s)     │
+│  - DHCP renew: udhcpc -i wlan0             │
+│  - config I/O: atomic write (tmp+rename)   │
+└──────────────────┬─────────────────────────┘
+                   │ QProcess (async, non-blocking)
+┌──────────────────▼─────────────────────────┐
+│  CLI tools: iw / wpa_cli / udhcpc          │
+│  → kernel WiFi driver → hardware (RV1106)  │
+└────────────────────────────────────────────┘
 ```
 
-## Project Layout
+**Why `wpa_cli` + `iw` + `udhcpc`?** Stock Luckfox rootfs provides these tools out of the box — no extra daemons or proprietary binaries. `wpa_supplicant` handles 802.11; `udhcpc` handles DHCP; the app orchestrates them.
+
+---
+
+## 📁 Project Structure
 
 ```
 Wifi_Scan/
-├── src/                 # C++ sources (wifimanager, main)
-├── qml/                 # QML UI (main.qml, error bar, etc.)
+├── src/                        # C++ application source
+│   ├── main.cpp                # embedded setup: linuxfb, fontdir, UTF-8, signal handler
+│   ├── wifimanager.h           # WifiManager class (QObject, Q_PROPERTY bindings)
+│   ├── wifimanager.cpp         # scan, connect, forget, watchdog, persistence
+│   ├── wifi-manager.pro        # qmake project (TARGET = wifi-manager)
+│   └── qml.qrc                 # embeds QML
+├── qml/                        # QML UI (all in QRC)
+│   └── main.qml                # root UI: scan bar, network list, error banner, password dialog
 ├── config/
-│   ├── board.env.example  # Template — copy to board.env and edit
-│   └── board.env          # REAL config (git-ignored, never committed)
+│   └── board.env.example       # template (IP/user/pass) — copy to board.env
 ├── scripts/
-│   ├── build.sh           # Build + deploy (qmake + make + expect SCP)
-│   ├── deploy.sh          # Deploy only (expect-based)
-│   ├── deploy.exp         # Expect driver for scp + chmod
-│   └── run_app.exp        # Run app on board + show log
-├── build/               # Build artifacts (git-ignored, empty in repo)
-├── wifi-manager.pro     # Qt project file
-├── qml.qrc              # QML resource manifest
-└── LICENSE              # MIT license
+│   ├── build.sh                # cross-compile (qmake + make) + deploy
+│   ├── deploy.sh               # deploy only (expect-based SCP)
+│   ├── deploy.exp              # expect driver for scp + chmod
+│   └── run_app.exp             # run app on board + show startup log
+├── build/                      # build output (gitignored; .gitkeep keeps dir)
+├── wifi-manager.pro            # Qt project file
+├── qml.qrc                     # QML resource manifest
+└── LICENSE                     # MIT license
 ```
 
-**Note:** The repo does not contain a `.gitignore`-ignored directory structure for `build/` and `config/` files. You must create these after cloning:
-- `config/` — clone repo, then `cp config/board.env.example config/board.env` and edit with your board's credentials
-- `build/` — created automatically by `./scripts/build.sh`
+---
 
-## Key Features
+## 🚀 Quick Start
 
-### Auto-connect on startup
-On first launch the app scans for available networks and auto-connects to the one with the strongest dBm signal.
-
-### Specific error messages
-On connect failure the error bar shows per-PROTOCOL:
-- `"Wrong password — authentication failed with <ssid>"` — wrong credentials (4-way handshake mismatch)
-- `"Cannot find <ssid> — network not in range"` — AP not reachable
-- `"Cannot connect to <ssid> — association failed"` — association timeout
-- `"Cannot connect to <ssid> — connection timed out"` — general timeout
-
-### Auto-rollback
-If a connect attempt fails with a wrong password, the app immediately rolls back to the previous saved network (or the strongest saved network if no previous connect).
-
-### Self-healing wlan0
-If wlan0 goes down (wpa_supplicant dead, interface `NO-CARRIER`):
-- Watchdog detects `wlan0` admin-UP flag missing → starts `wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf`
-- Recovery command removes stale `/var/run/wpa_supplicant/wlan0` socket, clears `wlan0`, restarts wpa_supplicant, brings interface up
-
-### WPA3 / WPA2-PSK
-All networks are WPA2-PSK (PBKDF2-SHA1, hex PSK stored in config). No WPA3 (SAE) support yet (requires Buildroot rebuild).
-
-### Network list management
-- `connectsaved <ssid>` — connect to a previously saved network
-- `forget <ssid>` — remove a network from `wpa_supplicant.conf` (kept in wpa_supplicant runtime)
-- `disconnect` — clean disconnect
-
-### Simulation (headless testing)
-Inject commands via `/tmp/wifi_sim_cmd` over SSH:
 ```bash
-ssh root@<board_ip> "echo 'scan' > /tmp/wifi_sim_cmd"
-ssh root@<board_ip> "echo 'connectsaved Tamnguyen' > /tmp/wifi_sim_cmd"
-```
-The app reads the file in `pollSimCommands()` and executes commands. No interactive session required.
+# 1. Board config (first time)
+cp config/board.env.example config/board.env
+# edit BOARD_IP, BOARD_USER, BOARD_PASS, BOARD_DEST
 
-## Build & Deploy
+# 2. Cross-compile + deploy to board
+./scripts/build.sh            # → build/wifi-manager (ARM ELF)
 
-| Command | Description |
-|---|---|
-| `./scripts/build.sh` | Build + deploy to board (expect-based SSH) |
-| `./scripts/deploy.sh` | Deploy only (binary in build/) |
-| `./scripts/deploy.exp <board.env> <binary>` | Manual deploy with env file |
-
-**Override**:
-```bash
-BOARD_IP=192.168.1.11 ./scripts/build.sh   # Use a different board IP
+# 3. Run on board
+./scripts/run_app.exp config/board.env   # starts app + prints startup log
 ```
 
-## Running on Board
+> All board scripts use `expect` for password auth (no `sshpass` needed).  
+> Default board password: `luckfox`.
+
+### Manual run (via SSH)
 
 ```bash
-# Manual SSH
+ssh root@<board-ip>
+cd /root
 export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0:size=800x480:mmsize=800x480
 export QT_QPA_FONTDIR=/usr/share/fonts/dejavu/
 export LD_LIBRARY_PATH=/usr/lib:/usr/lib/qt5/lib
-/root/wifi-manager
+./wifi-manager
 ```
 
-**Headless** (non-interactive):
+---
+
+## 🔧 Configuration
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `BOARD_USER` | `root` | SSH username |
+| `BOARD_IP` | `192.168.1.2` | Board IP address |
+| `BOARD_PASS` | `luckfox` | SSH password |
+| `BOARD_DEST` | `/root` | Deploy directory on board |
+| `QT_QPA_PLATFORM` | `linuxfb:fb=/dev/fb0:size=800x480:mmsize=800x480` | Qt embedded display |
+| `QT_QPA_FONTDIR` | `/usr/share/fonts/dejavu/` | Font directory |
+| `LD_LIBRARY_PATH` | `/usr/lib:/usr/lib/qt5/lib` | Qt library path |
+
+**Real credentials live only in gitignored `config/board.env`** — never commit them.  
+The template `config/board.env.example` is safe to push.
+
+---
+
+## 🛠️ Cross-Compilation
+
 ```bash
-export QT_QPA_PLATFORM=linuxfb:fb=/dev/fb0:size=800x480:mmsize=800x480
-export QT_QPA_FONTDIR=/usr/share/fonts/dejavu/
-export LD_LIBRARY_PATH=/usr/lib:/usr/lib/qt5/lib
-/root/wifi-manager > /tmp/wifiapp.log 2>&1 &
+QMAKE=~/Desktop/LINUX/Build_Luckfox/luckfox-pico/sysdrv/source/buildroot/buildroot-2023.02.6/output/host/bin/qmake
+cd build
+$QMAKE ../wifi-manager.pro
+make -j$(nproc)
+# → build/wifi-manager (ELF 32-bit ARM, EABI5)
 ```
 
-## Security Notes
-
-- `config/board.env` is **git-ignored** — credentials (IP, username, password) are never committed.
-- Expect scripts use `StrictHostKeyChecking=no` only for local dev; production: pin host key via `ssh-keyscan`, use SSH key auth (`ssh-copy-id`), and disable password authentication.
-- Passwords are stored as **hex PSK** (PBKDF2-SHA1) in `/etc/wpa_supplicant.conf` with `0600` permissions — never plaintext.
-- `config/board.env.example` is the template — no real credentials in it.
-
-## Troubleshooting
-
-### "Failed to connect to non-global ctrl_ifname: wlan0"
-If you see this error, wpa_supplicant is not running. The app tries to restart it automatically via `ensureWpaSupplicant()`. If it still fails, try:
+**Override board IP on the fly:**
 ```bash
-ssh root@<board_ip> "pkill -9 wpa_supplicant; wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf; ip link set wlan0 up"
+BOARD_IP=192.168.1.11 ./scripts/build.sh
 ```
 
-### wlan0 "down" but admin-UP
-On the Luckfox board `iw dev wlan0 scan` works but `wpa_supplicant` is dead — the admin-UP flag is present but no-carry.
-Recovery: the watchdog detects `NO-CARRIER` and calls `startInterfaceRecovery()`.
+---
 
-### Connection timeout after 15s
-Default max wait is **15s** (from 25s). If you still see the generic error, the issue is a weak signal, AP not in range, or wrong password — check with `iw dev wlan0 scan` manually to confirm the SSID is visible.
+## 🧪 Verification on Board
 
-## Supported Hardware
+```bash
+# Process alive
+pgrep -f wifi-manager
 
-| Board | WiFi Chip | Network |
-|---|---|---|
-| Luckfox Pico Ultra W | RV1106 / Ralink | 2.4 GHz |
+# QML loaded clean (0 ReferenceError / 0 TypeError)
+./wifi-manager > /tmp/app.log 2>&1 &
+sleep 3 && grep -c "ReferenceError\|TypeError" /tmp/app.log
+# → should print 0
 
-5 GHz is not supported — the RV1106 WiFi module is a 2.4 GHz only chip.
+# Framebuffer rendered (non-zero bytes drawn)
+cat /dev/fb0 | tr -d '\000' | wc -c   # ~1.5MB for 800×480×32
 
-## License
+# WiFi scan works
+iw dev wlan0 scan | grep -E "SSID|signal"
+
+# wpa_supplicant running
+pgrep wpa_supplicant
+
+# DHCP lease acquired
+ip -4 addr show wlan0
+```
+
+---
+
+## 🎯 Roadmap
+
+1. **WPA3 (SAE) support** — requires Buildroot rebuild with `CONFIG_SAE=y`
+2. **5 GHz band** — ❌ hardware limitation (RV1106 WiFi module is 2.4 GHz only)
+3. **Captive portal detection** — auto-open browser on portal networks
+4. **Network priority UI** — drag-to-reorder saved networks
+5. **Hotspot mode** — `wpa_supplicant` P2P / AP mode for tethering
+
+---
+
+## 📚 Docs
+
+- This `README.md` — overview, build, run, config, verification
+- `LICENSE` — MIT
+
+---
+
+## 📝 License
 
 MIT — see `LICENSE` file.
+
+**Real board credentials live only in gitignored `config/board.env`** — never commit them.

@@ -1,5 +1,6 @@
-# Build artifacts
-build/
+# Build artifacts (track the directory via .gitkeep)
+build/*
+!build/.gitkeep
 *.o
 *.a
 *.so
@@ -13,6 +14,8 @@ Makefile
 # Board config — contains credentials (IP/password), never push
 config/board.env
 config/*.local
+!config/.gitkeep
+!config/board.env.example
 
 # Editor/OS
 .vscode/

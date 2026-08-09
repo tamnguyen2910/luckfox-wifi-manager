@@ -26,15 +26,21 @@ Wifi_Scan/
 ├── qml/                 # QML UI (main.qml, error bar, etc.)
 ├── config/
 │   ├── board.env.example  # Template — copy to board.env and edit
-│   └── board.env          # REAL config (git-ignored)
+│   └── board.env          # REAL config (git-ignored, never committed)
 ├── scripts/
 │   ├── build.sh           # Build + deploy (qmake + make + expect SCP)
 │   ├── deploy.sh          # Deploy only (expect-based)
 │   ├── deploy.exp         # Expect driver for scp + chmod
 │   └── run_app.exp        # Run app on board + show log
+├── build/               # Build artifacts (git-ignored, empty in repo)
 ├── wifi-manager.pro     # Qt project file
-└── qml.qrc               # QML resource manifest
+├── qml.qrc              # QML resource manifest
+└── LICENSE              # MIT license
 ```
+
+**Note:** The repo does not contain a `.gitignore`-ignored directory structure for `build/` and `config/` files. You must create these after cloning:
+- `config/` — clone repo, then `cp config/board.env.example config/board.env` and edit with your board's credentials
+- `build/` — created automatically by `./scripts/build.sh`
 
 ## Key Features
 

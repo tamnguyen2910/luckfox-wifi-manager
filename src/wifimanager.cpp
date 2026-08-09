@@ -8,7 +8,22 @@
 #include <QCryptographicHash>
 #include <QByteArray>
 #include <QMessageAuthenticationCode>
-#include <unistd.h> // for ::rename (POSIX)
+#include <QTime>
+#include <QThread>
+#include <unistd.h> // for ::rename, ::chown (POSIX)
+#include <sys/stat.h> // for ::chmod, ::stat (P1 security: config 0600)
+#include <cerrno> // for errno in chmod failure logs
+#include <cstring> // for strerror
+
+namespace {
+// Timestamped log prefix for the debug/action log lines, e.g.
+//   [14:03:22.415][ACT] Connect requested ...
+// Correlates with the [UI] lines written by main.qml.
+QString logTime()
+{
+    return QTime::currentTime().toString("HH:mm:ss.zzz");
+}
+} // namespace
 
 WifiManager::WifiManager(QObject *parent)
     : QObject(parent)
@@ -24,7 +39,7 @@ WifiManager::WifiManager(QObject *parent)
     , m_connectAttemptCounter(0)
     , m_statusPollTimer()
     , m_pollingInterval(2000)
-    , m_maxConnectWaitSeconds(25)
+    , m_maxConnectWaitSeconds(15)
     , m_scanTimeoutTimer()
     , m_connectTimeoutTimer()
     , m_isConnecting(false)
@@ -35,9 +50,13 @@ WifiManager::WifiManager(QObject *parent)
     , m_pendingIpAddress()
     , m_pendingSsid()
     , m_checkStep(0)
-    , m_wpaCLIBuffer()
     , m_dhcpProcess(nullptr)
+    , m_wpaCLIBuffer()
     , m_autoScanTimer(nullptr)
+    , m_handshakeFailCount(0)
+    , m_seenFourWay(false)
+    , m_fourWayConsecutive(0)
+    , m_sawAssociating(false)
 {
     // Initialize scan process (async, non-blocking)
     m_wifiScanProcess = new QProcess(this);
@@ -72,6 +91,8 @@ WifiManager::WifiManager(QObject *parent)
     });
     QObject::connect(m_ipCheckProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                      this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                         // P1: process finished (any path) — disarm the hang-guard
+                         m_checkTimeoutTimer.stop();
                          // Only process result if process exited normally (not killed/crashed)
                          if (exitStatus != QProcess::NormalExit || exitCode != 0) {
                              qDebug() << "[WifiManager] ip check process failed:" << exitCode << exitStatus;
@@ -112,6 +133,8 @@ WifiManager::WifiManager(QObject *parent)
     });
     QObject::connect(m_ssidCheckProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                      this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                         // P1: process finished (any path) — disarm the hang-guard
+                         m_checkTimeoutTimer.stop();
                          // Only process result if process exited normally (not killed/crashed)
                          if (exitStatus != QProcess::NormalExit || exitCode != 0) {
                              qDebug() << "[WifiManager] ssid check process failed:" << exitCode << exitStatus;
@@ -122,24 +145,138 @@ WifiManager::WifiManager(QObject *parent)
                              }
                              return;
                          }
-                         if (m_checkStep == 2) {
-                             // Parse SSID and wpa_state from wpa_cli status output
-                             QString output = QString::fromUtf8(m_ssidCheckProcess->readAllStandardOutput());
-                             const QStringList lines = output.split('\n');
-                             bool completed = false;
-                             for (const QString &line : lines) {
-                                 const QString t = line.trimmed();
-                                 if (t.startsWith("ssid="))
-                                     m_pendingSsid = t.mid(5);
-                                 else if (t.startsWith("wpa_state=COMPLETED"))
+                         // Parse SSID, wpa_state and ip_address from wpa_cli status output.
+                         QString output = QString::fromUtf8(m_ssidCheckProcess->readAllStandardOutput());
+                         const QStringList lines = output.split('\n');
+                         bool completed = false;
+                         QString currentWpaState;
+                         QString currentSsid;
+                         QString currentIp;
+                         for (const QString &line : lines) {
+                             const QString t = line.trimmed();
+                             if (t.startsWith("ssid="))
+                                 currentSsid = t.mid(5);
+                             else if (t.startsWith("wpa_state=")) {
+                                 currentWpaState = t.mid(10);
+                                 if (currentWpaState == "COMPLETED")
                                      completed = true;
+                             } else if (t.startsWith("ip_address=")) {
+                                 currentIp = t.mid(11);
                              }
+                         }
+
+                         // Handshake failure tracking for wrong password detection.
+                         // wpa_supplicant returns to DISCONNECTED/INACTIVE/SCANNING
+                         // right after 4WAY_HANDSHAKE when credentials are wrong.
+                         //
+                         // Counting is driven by m_seenFourWay (not m_lastWpaState):
+                         // the 2s poll can miss the brief 4WAY_HANDSHAKE window on a
+                         // fast MIC failure, so once we've SEEN a 4WAY_HANDSHAKE, the
+                         // next failure-state counts as one failed AP. With a
+                         // multi-BSSID network, supplicant retries each AP of the same
+                         // SSID — each failed AP increments the count, and reaching
+                         // >=3 within one connect attempt is treated as wrong password.
+                         if (m_isConnecting && !currentWpaState.isEmpty()) {
+                             m_lastWpaState = currentWpaState; // for specific error messages
+                             // Track if we ever associated with the AP (or reached 4WAY).
+                             // If we did but never completed, it's wrong password
+                             // (the AP is present but rejected the handshake).
+                             if (currentWpaState == "ASSOCIATING" ||
+                                 currentWpaState == "4WAY_HANDSHAKE")
+                                 m_sawAssociating = true;
+                             if (currentWpaState == "4WAY_HANDSHAKE") {
+                                 m_seenFourWay = true;
+                                 // Fast wrong-password detection: stuck in 4WAY for
+                                 // >=3 consecutive polls (~6s) means the AP is rejecting
+                                 // the handshake — no need to wait for the DISCONNECTED
+                                 // transition (which the 2s poll can miss entirely).
+                                 ++m_fourWayConsecutive;
+                                 if (m_fourWayConsecutive >= 3) {
+                                     qDebug() << "[WifiManager] Stuck in 4WAY_HANDSHAKE for"
+                                              << m_fourWayConsecutive << "polls — treating as wrong password";
+                                     m_handshakeFailCount = 3; // triggers fast-fail on next poll
+                                 }
+                             } else {
+                                 m_fourWayConsecutive = 0;
+                             }
+                             if (m_seenFourWay &&
+                                 (currentWpaState == "DISCONNECTED" ||
+                                  currentWpaState == "INACTIVE" ||
+                                  currentWpaState == "SCANNING" ||
+                                  currentWpaState == "ASSOCIATING")) {
+                                 m_handshakeFailCount++;
+                                 m_seenFourWay = false; // re-arm on the next 4WAY_HANDSHAKE
+                                 qDebug() << "[WifiManager] Handshake failed (AP retry), count:"
+                                          << m_handshakeFailCount;
+                             }
+                             if (currentWpaState == "COMPLETED") {
+                                 m_handshakeFailCount = 0;
+                                 m_seenFourWay = false;
+                                 m_fourWayConsecutive = 0;
+                             }
+                         }
+
+                         if (m_checkStep == 2) {
+                             // Async (non-connecting) check flow — IP came from `ip addr show`.
+                             m_pendingSsid = currentSsid;
                              // Only declare connected when wpa_supplicant fully authenticated
                              if (!completed)
                                  m_pendingSsid.clear();
-                             // Complete connection check with parsed data
                              finalizeConnectionCheck(m_pendingIpAddress, m_pendingSsid);
                              m_checkStep = 0;
+                         } else if (m_isConnecting) {
+                             // CONNECTING flow — detected wpa_state=COMPLETED on wpa_cli status.
+                             //
+                             // IMPORTANT: during a connect flow we are now using the
+                             // `m_isConnecting` branch instead of `m_checkStep == 2`, because
+                             // `m_checkStep` was never set to 2 during the connect flow.
+                             // This fix was the root cause of the "stuck at Connecting..." bug.
+                             qDebug() << "[WifiManager] ssid check during connect: state="
+                                      << currentWpaState << "ssid=" << currentSsid << "ip=" << currentIp;
+                             if (completed && !currentSsid.isEmpty()) {
+                                 // COMPLETED on the TARGET network — normal success path.
+                                 if (currentSsid == m_currentSSID) {
+                                     m_otherNetworkCount = 0;
+                                     m_otherNetworkSsid.clear();
+                                     const QString ipForConnect = !currentIp.isEmpty()
+                                                                      ? currentIp
+                                                                      : m_pendingIpAddress;
+                                     finalizeConnectionCheck(ipForConnect, currentSsid);
+                                 } else {
+                                     // COMPLETED on a DIFFERENT network than the target:
+                                     // wpa_supplicant has auto-rolled back to a saved network
+                                     // (the new AP failed associate/auth and supplicant fell
+                                     // back to the last good one). Treat as a failed connect
+                                     // that ended on the previous network.
+                                     if (m_otherNetworkSsid == currentSsid) {
+                                         m_otherNetworkCount++;
+                                     } else {
+                                         m_otherNetworkSsid = currentSsid;
+                                         m_otherNetworkCount = 1;
+                                     }
+                                     // Require 2 consecutive polls (~4s) to avoid a false
+                                     // positive from a transient stale COMPLETED during a
+                                     // legitimate network switch.
+                                     if (m_otherNetworkCount >= 2) {
+                                         qDebug() << "[WifiManager] Auto-rollback detected: supplicant on"
+                                                  << currentSsid << "after failing to connect to" << m_currentSSID;
+                                         m_lastError = "Could not connect to " + m_currentSSID
+                                                       + " -- rolled back to " + currentSsid;
+                                         emit lastErrorChanged();
+                                         m_otherNetworkSsid.clear();
+                                         m_otherNetworkCount = 0;
+                                         // Finalize as connected to the rolled-back network
+                                         const QString ipForConnect = !currentIp.isEmpty()
+                                                                          ? currentIp
+                                                                          : m_pendingIpAddress;
+                                         finalizeConnectionCheck(ipForConnect, currentSsid);
+                                     }
+                                 }
+                             } else if (currentSsid != m_currentSSID) {
+                                 // Not completed, and not the target — reset the counter
+                                 m_otherNetworkCount = 0;
+                                 m_otherNetworkSsid.clear();
+                             }
                          }
                      });
 
@@ -205,27 +342,24 @@ WifiManager::WifiManager(QObject *parent)
         }
     });
 
+    // Initialize check timeout timer (P1: 5s guard for ip addr show / wpa_cli status hangs)
+    m_checkTimeoutTimer.setInterval(kCheckTimeoutMs);
+    m_checkTimeoutTimer.setSingleShot(true);
+    QObject::connect(&m_checkTimeoutTimer, &QTimer::timeout, this, &WifiManager::onCheckTimeout);
+
     // Load saved networks from config for remember-password feature
     loadSavedNetworks();
 
-    // Auto-reconnect to preferred saved network on startup.
-    // Priority: "Tamnguyen" if present in saved networks.
-    // Wait a bit for interface to be ready, then attempt connection.
-    QTimer::singleShot(1000, this, [this]() {
-        // Skip if already connected (wpa_supplicant may have auto-associated
-        // from update_config on boot).
+    // Auto-reconnect to strongest saved network on startup (RF-04).
+    // Wait for first scan completion, then connect to the saved network
+    // with the best signal strength. Skip if already connected.
+    QTimer::singleShot(1500, this, [this]() {
         if (m_isConnected) {
             qDebug() << "[WifiManager] Startup: already connected, skipping auto-reconnect";
             return;
         }
-        if (m_savedSSIDs.contains("Tamnguyen")) {
-            qDebug() << "[WifiManager] Startup: auto-reconnecting to preferred network" << "Tamnguyen";
-            connectSaved("Tamnguyen");
-        } else if (!m_savedSSIDs.isEmpty()) {
-            // Fallback: connect to the first saved network if Tamnguyen not found
-            QString fallback = *m_savedSSIDs.begin();
-            qDebug() << "[WifiManager] Startup: auto-reconnecting to fallback saved network" << fallback;
-            connectSaved(fallback);
+        if (interfaceExists() && interfaceIsUp() && !m_isScanning) {
+            scan();
         }
     });
 
@@ -242,6 +376,13 @@ WifiManager::WifiManager(QObject *parent)
     // connected, and after auto-reconnect). Guards inside the timer
     // callback skip while a connect/DHCP is in progress.
     startAutoScan();
+
+    // Debug: headless input simulation — polls /tmp/wifi_sim_cmd every 500ms
+    m_simTimer = new QTimer(this);
+    m_simTimer->setInterval(500);
+    connect(m_simTimer, &QTimer::timeout, this, &WifiManager::pollSimCommands);
+    m_simTimer->start();
+    qDebug() << logTime() << "[WifiManager] Sim command polling started (500ms interval)";
 }
 
 WifiManager::~WifiManager()
@@ -262,6 +403,82 @@ WifiManager::~WifiManager()
         m_ssidCheckProcess->kill();
     if (m_dhcpProcess && m_dhcpProcess->state() != QProcess::NotRunning)
         m_dhcpProcess->kill();
+    if (m_simTimer)
+        m_simTimer->stop();
+    if (m_recoveryProcess && m_recoveryProcess->state() != QProcess::NotRunning)
+        m_recoveryProcess->kill();
+}
+
+// ==================== SIM COMMANDS (headless input) ====================
+
+void WifiManager::pollSimCommands()
+{
+    QFile cmdFile("/tmp/wifi_sim_cmd");
+    if (!cmdFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return; // no command file
+    }
+    QString cmd = QString::fromUtf8(cmdFile.readAll()).trimmed();
+    cmdFile.close();
+
+    if (!cmd.isEmpty()) {
+        // Remove command file after reading (single-shot)
+        QFile::remove("/tmp/wifi_sim_cmd");
+        qDebug() << "[SIM] Received command:" << cmd;
+        execSimCommand(cmd);
+    }
+}
+
+void WifiManager::execSimCommand(const QString &cmd)
+{
+    const QStringList parts = cmd.split(' ', Qt::SkipEmptyParts);
+    if (parts.isEmpty()) return;
+
+    const QString action = parts[0].toLower();
+
+    if (action == "scan") {
+        qDebug() << "[ACT] Sim: scan";
+        scan();
+    } else if (action == "connect" && parts.size() >= 3) {
+        QString ssid = parts[1];
+        QString password = parts.mid(2).join(' ');
+        qDebug() << "[ACT] Sim: connect to" << ssid << "(pwd len:" << password.length() << ")";
+        connectToNetwork(ssid, password);
+    } else if (action == "connectsaved" && parts.size() >= 2) {
+        QString ssid = parts[1];
+        qDebug() << "[ACT] Sim: connect saved" << ssid;
+        connectSaved(ssid);
+    } else if (action == "forget" && parts.size() >= 2) {
+        QString ssid = parts[1];
+        qDebug() << "[ACT] Sim: forget" << ssid;
+        forgetNetwork(ssid);
+    } else if (action == "disconnect") {
+        qDebug() << "[ACT] Sim: disconnect";
+        disconnectFromNetwork();
+    } else if (action == "status") {
+        logStatus();
+    } else if (action == "log") {
+        logStatus();
+    } else {
+        qWarning() << "[SIM] Unknown command:" << cmd;
+        qDebug() << "[SIM] Available: scan | connect <ssid> <password> | connectsaved <ssid> | forget <ssid> | disconnect | status";
+    }
+}
+
+void WifiManager::logStatus()
+{
+    qDebug() << "[STA] Status dump:";
+    qDebug() << "  m_isScanning:" << m_isScanning;
+    qDebug() << "  m_isConnected:" << m_isConnected;
+    qDebug() << "  m_isConnecting:" << m_isConnecting;
+    qDebug() << "  m_connectedSSID:" << m_connectedSSID;
+    qDebug() << "  m_connectedIP:" << m_connectedIP;
+    qDebug() << "  m_connectionStatus:" << m_connectionStatus;
+    qDebug() << "  m_connectStep:" << m_connectStep;
+    qDebug() << "  m_handshakeFailCount:" << m_handshakeFailCount;
+    qDebug() << "  m_seenFourWay:" << m_seenFourWay;
+    qDebug() << "  m_renewalPending:" << m_renewalPending;
+    qDebug() << "  m_scanResults.count:" << m_scanResults.size();
+    qDebug() << "  m_savedSSIDs:" << m_savedSSIDs.values();
 }
 
 // ==================== SCAN ====================
@@ -284,11 +501,17 @@ void WifiManager::scan()
         return;
     }
 
+    // Ensure wpa_supplicant is alive before scanning — if the control
+    // socket is missing, wpa_cli won't work. Start it if needed.
+    ensureWpaSupplicant();
+
     m_isScanning = true;
     emit isScanningChanged();
 
     m_currentScanOutput.clear();
-    m_scanResults.clear();
+    // NOTE: don't clear m_scanResults here — if this scan fails, the UI keeps
+    // the previous results instead of flashing an empty list. parseWifiScanOutput
+    // replaces the list wholesale on success anyway.
 
     // Start scan with dedicated timeout
     m_scanTimeoutTimer.start(5000); // 5s max for scan
@@ -302,15 +525,96 @@ void WifiManager::onWifiScanReadyRead()
 
 void WifiManager::onWifiScanFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
-    Q_UNUSED(exitCode);
-    Q_UNUSED(exitStatus);
+    // If we are not in scanning state, this finished signal is from a process
+    // that was killed intentionally (e.g., by connectToNetwork). Ignore it.
+    if (!m_isScanning) {
+        m_scanTimeoutTimer.stop();
+        return;
+    }
+
     m_scanTimeoutTimer.stop();
 
+    if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+        // Scan process failed or was killed unexpectedly.
+        m_isScanning = false;
+        m_connectionStatus = "Scan failed";
+        emit isScanningChanged();
+        emit connectionStateChanged();
+        qWarning() << "[WifiManager] iw scan failed:" << exitCode << exitStatus;
+        return;
+    }
+
+    // Successful scan: parse the output and update results.
     parseWifiScanOutput(m_currentScanOutput);
+
+    // Adaptive auto-scan (RF-03): track connected network signal to adjust interval
+    if (m_isConnected && !m_connectedSSID.isEmpty()) {
+        const int oldInterval = m_autoScanInterval;
+        // Find the connected network in the new scan results
+        for (const QVariant &item : m_scanResults) {
+            QVariantMap map = item.toMap();
+            if (map.value("ssid").toString() == m_connectedSSID) {
+                int currentSignal = map.value("signal").toInt(); // dBm
+                if (m_lastConnectedSignal != 0) {
+                    int delta = qAbs(currentSignal - m_lastConnectedSignal);
+                    if (delta <= 5) {
+                        // Stable signal — increase interval (cap at 180s)
+                        m_scanStableCount++;
+                        if (m_scanStableCount >= 2) {
+                            m_autoScanInterval = qMin(m_autoScanInterval + 30000, 180000);
+                        }
+                    } else if (delta >= 15) {
+                        // Movement detected — drop to 30s
+                        m_autoScanInterval = 30000;
+                        m_scanStableCount = 0;
+                    } else {
+                        // Moderate change — decrease interval slightly (floor 60s)
+                        m_autoScanInterval = qMax(m_autoScanInterval - 10000, 60000);
+                        m_scanStableCount = 0;
+                    }
+                }
+                m_lastConnectedSignal = currentSignal;
+                qDebug() << "[WifiManager] Adaptive scan: connected signal" << currentSignal
+                         << "dBm, interval" << m_autoScanInterval << "ms";
+                break;
+            }
+        }
+        // Apply the new interval immediately: restart the running timer so the
+        // countdown uses the adjusted value instead of the previous one.
+        if (m_autoScanInterval != oldInterval && m_autoScanTimer && m_autoScanTimer->isActive()) {
+            m_autoScanTimer->start(m_autoScanInterval);
+        }
+    }
 
     m_isScanning = false;
     emit isScanningChanged();
     emit scanResultsChanged();
+
+    // RF-04: startup auto-connect to strongest saved network.
+    // Runs once, after the first scan completes (triggered by the startup
+    // singleShot in the constructor). scanResults are sorted by signal,
+    // so pick the first saved network we encounter.
+    if (!m_autoConnectDone && !m_isConnected && !m_isConnecting && !m_scanResults.isEmpty()) {
+        m_autoConnectDone = true;
+        QString strongestSaved;
+        int bestSignal = -100;
+        for (const QVariant &item : m_scanResults) {
+            QVariantMap map = item.toMap();
+            const QString s = map.value("ssid").toString();
+            const int sig = map.value("signal").toInt();
+            if (m_savedSSIDs.contains(s) && sig > bestSignal) {
+                bestSignal = sig;
+                strongestSaved = s;
+            }
+        }
+        if (!strongestSaved.isEmpty()) {
+            qDebug() << "[WifiManager] Startup auto-connect: strongest saved network"
+                     << strongestSaved << "@" << bestSignal << "dBm";
+            connectSaved(strongestSaved);
+        } else {
+            qDebug() << "[WifiManager] Startup auto-connect: no saved network in range";
+        }
+    }
 }
 
 void WifiManager::parseWifiScanOutput(const QString &output)
@@ -419,7 +723,7 @@ void WifiManager::parseWifiScanOutput(const QString &output)
 
 // ==================== CONNECT ====================
 
-void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
+void WifiManager::connectToNetwork(const QString &ssid, const QString &password, bool passwordIsHex)
 {
     // Abort any in-flight connect/forget state machine first.
     // Kill both wpa_cli and scan process to avoid race conditions.
@@ -427,6 +731,26 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
         m_wpaCLIProcess->kill();
     if (m_wifiScanProcess->state() != QProcess::NotRunning)
         m_wifiScanProcess->kill();
+
+    // P0 fix: bump flow token — any callback from a previous connect flow
+    // will see the mismatch and be discarded (stale-callback guard).
+    ++m_flowToken;
+
+    // P0 fix (SHIFT bug): use the explicit source-of-truth parameter.
+    // - User-typed password (QML calls connectToNetwork without 3rd arg):
+    //   default false → ALWAYS treated as passphrase, even if it looks like
+    //   64 hex chars (SHIFT bug fix).
+    // - connectSaved() passes true when the stored psk is hex → sent as hex PSK.
+    m_passwordIsHex = passwordIsHex;
+
+    // RF-42 auto-rollback: remember the currently connected network BEFORE
+    // resetting state, so if this connect attempt fails we can reconnect to it.
+    // Only meaningful when we were connected to a different, saved network.
+    if (m_isConnected && !m_connectedSSID.isEmpty()) {
+        m_previousSSID = m_connectedSSID;
+        qDebug() << "[WifiManager] Rollback target saved:" << m_previousSSID;
+    }
+
     m_wpaCLIBuffer.clear();       // discard stale output from killed process
     m_connectStep = 0;            // reset state machine
     m_isConnecting = false;
@@ -435,10 +759,25 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
     m_connectTotalTimer.stop();   // cancel any pending global connect timeout
     stopStatusPolling();
 
+    // Pause auto-scan while connecting — scanning would disturb wpa_supplicant
+    // and could cause connection failures.
+    if (m_autoScanTimer && m_autoScanTimer->isActive()) {
+        m_autoScanTimer->stop();
+        qDebug() << "[WifiManager] Auto-scan paused for connect";
+    }
+
     if (!interfaceExists()) {
         m_connectionStatus = "Failed: wlan0 not found";
         emit connectionStateChanged();
         qDebug() << "[WifiManager] ERROR: wlan0 interface does not exist";
+        return;
+    }
+
+    // Validate SSID: max 32 bytes (802.11), no control chars, no config injection
+    if (!isValidSSID(ssid)) {
+        m_connectionStatus = "Invalid SSID";
+        emit connectionStateChanged();
+        qDebug() << "[WifiManager] ERROR: Invalid SSID:" << ssid;
         return;
     }
 
@@ -453,23 +792,29 @@ void WifiManager::connectToNetwork(const QString &ssid, const QString &password)
     m_isConnecting = true;
     m_forgetMode = false;
     m_connectionStatus = "Connecting...";
+    // Reset handshake failure tracking for this connect attempt
+    m_handshakeFailCount = 0;
+    m_seenFourWay = false;
+    m_fourWayConsecutive = 0;
+    m_lastWpaState.clear();
+
+    // Ensure wpa_supplicant is alive before connecting — this was the root
+    // cause of "Failed to connect to non-global ctrl_ifname" errors after
+    // wpa_supplicant was killed by config-file deletion.
+    ensureWpaSupplicant();
+
     m_connectTotalTimer.start(); // global 90s timeout for whole connect flow
     emit connectionStateChanged();
 
     qDebug() << "[WifiManager] Connecting to:" << ssid;
 
-    // Step 1: Write wpa_supplicant.conf
-    if (!writeWpaSupplicantConfig(ssid, cleanPassword)) {
-        m_isConnecting = false;
-        m_connectionStatus = "Failed to write config";
-        emit connectionStateChanged();
-        return;
-    }
-    loadSavedNetworks(); // refresh in-memory saved list
-
-    // Store password for async steps
+    // NOTE: Do NOT write wpa_supplicant.conf yet. That is deferred to
+    // finalizeConnectionCheck (success path) so a network with the wrong
+    // password never ends up persisted to disk. The running wpa_supplicant
+    // config (add_network / set_network below) is temporary and removed on
+    // failure by the postConnectCleanup in abortConnect().
     m_pendingPassword = cleanPassword;
-    
+
     // Start async connection state machine
     m_connectStep = 1; // add_network
     startAddNetwork();
@@ -518,8 +863,10 @@ bool WifiManager::writeWpaSupplicantConfig(const QString &ssid, const QString &p
     ns << "network={\n";
     ns << "    ssid=\"" << ssid << "\"\n";
     if (!password.isEmpty()) {
-        // Check if password is already a hex PSK (64 hex chars — e.g. reconnecting from saved)
-        bool alreadyHex = isHexPskString(password);
+        // P0 fix (SHIFT bug): use the source-of-truth flag, NOT content
+        // guessing. connectToNetwork() (user-typed) sets false; connectSaved()
+        // (read back from config) sets true only when the stored psk was hex.
+        bool alreadyHex = m_passwordIsHex;
         if (!alreadyHex) {
             // Normal password → convert to hex PSK via PBKDF2-SHA1
             QString hexPsk = generateHexPsk(ssid, password);
@@ -571,7 +918,7 @@ void WifiManager::onWpaCLIReadyRead()
     qDebug() << "[WifiManager] wpa_cli output:" << m_wpaCLIBuffer.trimmed();
 }
 
-void WifiManager::onWpaCLIFinished(int exitCode, QProcess::ExitStatus exitStatus)
+void WifiManager::onWpaCLIFinished(int /*exitCode*/, QProcess::ExitStatus exitStatus)
 {
     m_connectTimeoutTimer.stop();
 
@@ -638,11 +985,15 @@ void WifiManager::stopStatusPolling()
 
 void WifiManager::beginConnectPolling()
 {
-    // Always renew DHCP first when switching networks — wpa_supplicant
-    // only handles 802.11, not DHCP. Without renewal, wlan0 keeps the
-    // OLD AP's lease and the SAME IP shows up for every network.
+    // Start status polling FIRST so wpa_state is checked immediately,
+    // even before DHCP finishes. This is critical for fast-fail on wrong
+    // password: if DHCP blocks until lease expires, the wrong-password
+    // detection (4WAY_HANDSHAKE fast-fail) would be delayed by the DHCP
+    // retry cycle (~5 × 8s = 40s), making the "wrong password" error
+    // appear extremely late.
     m_renewalRetries = 0;
-    qDebug() << "[WifiManager] beginConnectPolling: starting DHCP renewal";
+    qDebug() << "[WifiManager] beginConnectPolling: starting status polling + DHCP renewal";
+    startStatusPolling();
     startDhcpRenewal();
 }
 
@@ -650,15 +1001,48 @@ void WifiManager::onStatusPollingTimeout()
 {
     m_connectAttemptCounter++;
 
-    // Max wait: ~25 seconds (13 polls at 2s interval)
+    // Fast fail: if handshake failed 3+ times, it's almost certainly wrong password.
+    // This catches it in ~6-8s instead of waiting for 25s/90s timeouts.
+    if (m_isConnecting && m_handshakeFailCount >= 3) {
+        qDebug() << "[WifiManager] Fast-fail: wrong password detected (handshake failed" << m_handshakeFailCount << "times)";
+        abortConnect(QString("Wrong password -- authentication failed with %1")
+                         .arg(m_currentSSID));
+        return;
+    }
+
+    // Fallback fast-fail: AIC driver may pass through 4WAY_HANDSHAKE so briefly
+    // the 2s poll misses it entirely. Detect "no progress": if we've polled
+    // >=5 times (~10s) and wpa_state never reached COMPLETED but the network
+    // was successfully associated (i.e. last state is 4WAY_HANDSHAKE or the
+    // driver shows connect attempts), it's almost certainly wrong password.
+    // This avoids the generic "connection timed out" after 15s.
+    if (m_isConnecting && m_connectAttemptCounter >= 5 &&
+        m_lastWpaState == "4WAY_HANDSHAKE") {
+        qDebug() << "[WifiManager] No progress in 4WAY_HANDSHAKE after 5 polls — wrong password";
+        abortConnect(QString("Wrong password -- authentication failed with %1")
+                         .arg(m_currentSSID));
+        return;
+    }
+
+    // Max wait: ~15 seconds (8 polls at 2s interval)
     if (m_connectAttemptCounter > m_maxConnectWaitSeconds / (m_pollingInterval / 1000)) {
-        stopStatusPolling();
-        m_connectionStatus = "Connection failed";
-        m_isConnecting = false;
-        m_renewalPending = false; // give up on DHCP too
-        emit connectionStateChanged();
         qDebug() << "[WifiManager] Connection timeout after"
                  << m_maxConnectWaitSeconds << "seconds";
+        // Generate specific error message based on observed wpa_state
+        QString errorMsg;
+        if (m_sawAssociating) {
+            // We associated with the AP but never completed auth — the AP is
+            // present and reachable, so the failure is the handshake → wrong
+            // password. (On this AIC hardware the 4WAY window is so brief the
+            // 2s poll often never catches it; "ever saw ASSOCIATING" is the
+            // reliable discriminator between wrong password and not-in-range.)
+            errorMsg = QString("Wrong password -- authentication failed with %1")
+                          .arg(m_currentSSID);
+        } else {
+            errorMsg = QString("Cannot find %1 -- network not in range")
+                          .arg(m_currentSSID);
+        }
+        abortConnect(errorMsg);
         return;
     }
 
@@ -667,14 +1051,25 @@ void WifiManager::onStatusPollingTimeout()
         if (m_renewalRetries++ < 5) {
             m_renewalPending = false; // lambda will re-arm
             startDhcpRenewal();
-            return;
+            // Don't return — keep polling wpa_state so fast-fail still works
+        } else {
+            qDebug() << "[WifiManager] Poll: DHCP renewal gave up after retries";
+            m_renewalPending = false;
         }
-        qDebug() << "[WifiManager] Poll: DHCP renewal gave up after retries";
-        m_renewalPending = false;
     }
 
-    // Trigger async check instead of blocking check
-    startAsyncConnectionCheck();
+    // While connecting, poll wpa_cli status to detect both wrong password
+    // AND successful connection. The old code required m_pendingSsid to be
+    // non-empty, but m_pendingSsid is only set by startAsyncConnectionCheck()
+    // which runs when NOT connecting — so the SSID check was never started
+    // during the connect flow, leaving the UI stuck at "Connecting...".
+    if (m_isConnecting) {
+        if (m_ssidCheckProcess->state() == QProcess::NotRunning)
+            startSsidCheck();
+    } else {
+        // Not connecting — normal async check
+        startAsyncConnectionCheck();
+    }
 }
 
 // ==================== CONNECT STATE MACHINE ====================
@@ -682,6 +1077,11 @@ void WifiManager::onStatusPollingTimeout()
 void WifiManager::startAddNetwork()
 {
     if (m_connectStep != 1) return;
+    // P0: kill any existing wpa_cli process to ensure isolation between steps
+    if (m_wpaCLIProcess->state() != QProcess::NotRunning) {
+        m_wpaCLIProcess->kill();
+    }
+    m_wpaCLIBuffer.clear();
     m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0" << "add_network");
     qDebug() << "[WifiManager] startAddNetwork -> calling wpa_cli add_network";
 }
@@ -715,6 +1115,9 @@ void WifiManager::handleAddNetworkFinished()
 void WifiManager::startSetSsid()
 {
     if (m_connectStep != 2) return;
+    if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+        m_wpaCLIProcess->kill(); // P0: ensure isolation between steps
+    m_wpaCLIBuffer.clear();
     m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
         << "set_network" << m_pendingNetworkId << "ssid" << ('"' + m_currentSSID + '"'));
     qDebug() << "[WifiManager] startSetSsid -> set_network id ssid";
@@ -723,7 +1126,14 @@ void WifiManager::startSetSsid()
 void WifiManager::handleSetSsidFinished()
 {
     if (m_connectStep != 2) return;
-    m_wpaCLIBuffer.clear();
+    QString output = m_wpaCLIBuffer.trimmed();
+    m_wpaCLIBuffer.clear(); // P0: consume and clear
+    // wpa_cli set_network replies "OK" on success, "FAIL" on error.
+    if (output != "OK") {
+        qWarning() << "[WifiManager] set_network ssid FAILED:" << output;
+        abortConnect("set_network ssid failed");
+        return;
+    }
     m_connectStep = 3; // psk_or_key_mgmt
     startSetPskOrKeyMgmt();
 }
@@ -731,13 +1141,19 @@ void WifiManager::handleSetSsidFinished()
 void WifiManager::startSetPskOrKeyMgmt()
 {
     if (m_connectStep != 3) return;
-    
+    if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+        m_wpaCLIProcess->kill(); // P0: ensure isolation between steps
+    m_wpaCLIBuffer.clear();
+
     if (m_pendingPassword.isEmpty()) {
         // Open network
         m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
             << "set_network" << m_pendingNetworkId << "key_mgmt" << "NONE");
         qDebug() << "[WifiManager] startSetPskOrKeyMgmt -> set_network key_mgmt NONE";
-    } else if (isHexPskString(m_pendingPassword)) {
+    } else if (m_passwordIsHex) {
+        // P0 fix (SHIFT bug): only treat as hex PSK when the flag says so —
+        // never guess from the content. A user-typed 64-hex passphrase is a
+        // passphrase (flag=false) and goes through the quoted branch below.
         m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
             << "set_network" << m_pendingNetworkId << "psk" << m_pendingPassword);
         qDebug() << "[WifiManager] startSetPskOrKeyMgmt -> set_network hex PSK";
@@ -751,7 +1167,14 @@ void WifiManager::startSetPskOrKeyMgmt()
 void WifiManager::handleSetPskOrKeyMgmtFinished()
 {
     if (m_connectStep != 3) return;
+    QString output = m_wpaCLIBuffer.trimmed();
     m_wpaCLIBuffer.clear();
+    // wpa_cli set_network replies "OK" on success, "FAIL" on error.
+    if (output != "OK") {
+        qWarning() << "[WifiManager] set_network psk/key_mgmt FAILED:" << output;
+        abortConnect("set_network psk or key_mgmt failed");
+        return;
+    }
     m_connectStep = 4; // save_config
     startSaveConfig();
 }
@@ -759,6 +1182,9 @@ void WifiManager::handleSetPskOrKeyMgmtFinished()
 void WifiManager::startSaveConfig()
 {
     if (m_connectStep != 4) return;
+    if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+        m_wpaCLIProcess->kill(); // P0: ensure isolation between steps
+    m_wpaCLIBuffer.clear();
     m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0" << "save_config");
     qDebug() << "[WifiManager] startSaveConfig -> save_config";
 }
@@ -766,7 +1192,14 @@ void WifiManager::startSaveConfig()
 void WifiManager::handleSaveConfigFinished()
 {
     if (m_connectStep != 4) return;
+    QString output = m_wpaCLIBuffer.trimmed();
     m_wpaCLIBuffer.clear();
+    // wpa_cli save_config replies "OK" on success, "FAIL" on error.
+    if (output != "OK") {
+        qWarning() << "[WifiManager] save_config FAILED:" << output;
+        abortConnect("save_config failed");
+        return;
+    }
     m_connectStep = 5; // select_network
     startSelectNetwork();
 }
@@ -774,6 +1207,9 @@ void WifiManager::handleSaveConfigFinished()
 void WifiManager::startSelectNetwork()
 {
     if (m_connectStep != 5) return;
+    if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+        m_wpaCLIProcess->kill(); // P0: ensure isolation between steps
+    m_wpaCLIBuffer.clear();
     m_wpaCLIProcess->start("wpa_cli", QStringList() << "-i" << "wlan0"
         << "select_network" << m_pendingNetworkId);
     qDebug() << "[WifiManager] startSelectNetwork -> select_network";
@@ -818,11 +1254,52 @@ bool WifiManager::interfaceExists()
     return ifaceFile.exists();
 }
 
+void WifiManager::ensureWpaSupplicant()
+{
+    // If wpa_cli cannot reach the control socket, wpa_supplicant is not
+    // running (or died). Start it with the current config — wpa_supplicant
+    // will immediately associate to the best saved network (by priority).
+    // This is a fallback for the case where the user killed wpa_supplicant
+    // or it crashed; normally it is started by init scripts.
+    QFile sock("/var/run/wpa_supplicant/wlan0");
+    if (sock.exists())
+        return; // control socket present, wpa_supplicant running
+
+    qWarning() << "[WifiManager] wpa_supplicant control socket missing, starting it";
+    QProcess::startDetached("wpa_supplicant",
+        QStringList() << "-B" << "-i" << "wlan0" << "-c" << "/etc/wpa_supplicant.conf");
+    // Give it a moment to initialize the control socket before use
+    QThread::msleep(500);
+}
+
 bool WifiManager::interfaceIsUp()
 {
-    // operstate: "up" / "down" / "unknown" / "dormant"
-    // WiFi is frequently "dormant" while waiting for carrier/associate —
-    // that's NOT down, it's a normal transient state. Only "down" is real.
+    // Check admin flags first: IFF_UP (0x1) in /sys/class/net/wlan0/flags
+    // This reflects whether the interface was administratively brought up,
+    // regardless of operstate. operstate can be "down" even when the
+    // interface is admin-UP (e.g. when wpa_supplicant died but the driver
+    // is still loaded — iw scan still works in this state).
+    QFile flagsFile("/sys/class/net/wlan0/flags");
+    if (flagsFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QString flags = QString::fromUtf8(flagsFile.readAll()).trimmed();
+        flagsFile.close();
+        bool ok;
+        unsigned long flagVal = flags.toULong(&ok, 0);
+        if (ok && (flagVal & 0x1)) {
+            // Admin UP — also accept operstate "up"/"unknown"/"dormant"
+            QFile operFile("/sys/class/net/wlan0/operstate");
+            if (operFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QString state = QString::fromUtf8(operFile.readAll()).trimmed();
+                operFile.close();
+                // "down" with admin-UP = wpa_supplicant died, not interface lost
+                // Accept all states when admin flag is UP
+                return true;
+            }
+            // flags readable but operstate not → assume up
+            return true;
+        }
+    }
+    // Fallback: legacy operstate-only check
     QFile operFile("/sys/class/net/wlan0/operstate");
     if (!operFile.open(QIODevice::ReadOnly | QIODevice::Text))
         return false;
@@ -867,6 +1344,8 @@ void WifiManager::startIpCheck()
         qDebug() << "[WifiManager] IP check already running, skipping";
         return;
     }
+    // P1 (A5/RF-27): arm the 5s hang-guard before launching the process
+    m_checkTimeoutTimer.start();
     m_ipCheckProcess->start("ip", QStringList() << "-4" << "addr" << "show" << "wlan0");
 }
 
@@ -877,8 +1356,43 @@ void WifiManager::startSsidCheck()
         qDebug() << "[WifiManager] SSID check already running, skipping";
         return;
     }
+    // P1 (A5/RF-27): arm the 5s hang-guard before launching the process
+    m_checkTimeoutTimer.start();
     m_ssidCheckProcess->start("wpa_cli", QStringList() << "-i" << "wlan0" << "status");
 }
+
+// ==================== CHECK TIMEOUT (P1) ====================
+
+void WifiManager::onCheckTimeout()
+{
+    // P1 (A5/RF-27/28): if ip addr show or wpa_cli status hangs for >5s,
+    // kill both check processes and reset state. This prevents the UI from
+    // getting stuck in "Connecting..." when the network stack is unresponsive.
+    qWarning() << "[WifiManager] CHECK TIMEOUT: ip/wpa_cli status process hung, killing & resetting"
+               << "(m_checkStep=" << m_checkStep << ", m_isConnecting=" << m_isConnecting << ")";
+
+    // Kill any stuck check processes
+    if (m_ipCheckProcess->state() != QProcess::NotRunning) {
+        m_ipCheckProcess->kill();
+        m_ipCheckProcess->waitForFinished(1000);
+    }
+    if (m_ssidCheckProcess->state() != QProcess::NotRunning) {
+        m_ssidCheckProcess->kill();
+        m_ssidCheckProcess->waitForFinished(1000);
+    }
+
+    // Reset check state
+    m_checkStep = 0;
+    m_pendingIpAddress.clear();
+    m_pendingSsid.clear();
+
+    // If we were in a connect flow, abort it (the user will see "Connection failed")
+    if (m_isConnecting) {
+        abortConnect("Status check timed out");
+    }
+}
+
+// ==================== STATUS POLLING ====================
 
 void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QString &ssid)
 {
@@ -886,7 +1400,7 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
         // While actively connecting to a target SSID, ignore the old connection
         // until wpa_supplicant actually switches over
         if (m_isConnecting && ssid != m_currentSSID) {
-            qDebug() << "[WifiManager] Still on old network:" << ssid << "— waiting for" << m_currentSSID;
+            qDebug() << "[WifiManager] Still on network:" << ssid << "— waiting for" << m_currentSSID;
             return;
         }
 
@@ -898,6 +1412,16 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
         m_connectedSSID = ssid;
         m_connectionStatus = "Connected";
         m_isConnecting = false;
+        // Clear any lingering error from a previous failed connect attempt,
+        // so the error bar disappears on successful connection.
+        // NOTE: in the auto-rollback path (ssid != m_currentSSID), lastError
+        // was set to a specific "rolled back" message BEFORE this function —
+        // don't clear that one.
+        if (!m_lastError.isEmpty() && ssid == m_currentSSID) {
+            m_lastError.clear();
+            emit lastErrorChanged();
+            qDebug() << "[WifiManager] Cleared lastError on successful connect";
+        }
         if (!wasConnected || oldSSID != ssid || oldIP != ipAddress) {
             qDebug() << "[WifiManager] Connected:" << ssid << "@" << ipAddress;
             emit isConnectedChanged();
@@ -907,10 +1431,27 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
         stopStatusPolling();
         m_connectTimeoutTimer.stop(); // cancel any pending connect timeout
         m_connectTotalTimer.stop();   // connect succeeded, cancel global timeout
+
+        // Persist the network to disk ONLY now that connect succeeded —
+        // a wrong-password attempt must not be saved. Deferred write
+        // (was previously written upfront in connectToNetwork).
+        if (!m_savedSSIDs.contains(ssid)) {
+            bool okWrite = writeWpaSupplicantConfig(ssid, m_pendingPassword);
+            if (okWrite) {
+                qDebug() << "[WifiManager] Persisted config for" << ssid;
+                loadSavedNetworks(); // refresh in-memory saved list
+                updateSavedFlags();
+            } else {
+                qWarning() << "[WifiManager] Failed to persist config for" << ssid;
+            }
+        }
+
         // refresh scan results để cập nhật connected flag ngay lập tức (fix B1)
         updateSavedFlags();
         // cập nhật trong list ngay lập tức
         emit scanResultsChanged();
+        // Connect finished — resume auto-scan (was paused during connect)
+        resumeAutoScan();
 
         // If just switched to a new network, schedule an IP re-check after 4s
         // in case DHCP takes longer than the polling window to update wlan0
@@ -923,6 +1464,7 @@ void WifiManager::finalizeConnectionCheck(const QString &ipAddress, const QStrin
     } else {
         // Not fully connected yet — just update status if in polling mode
         if (!m_isConnecting) {
+            resumeAutoScan(); // connect flow over, resume auto-scan
             bool wasConnected = m_isConnected;
             m_isConnected = false;
             m_connectedSSID.clear();
@@ -1023,7 +1565,22 @@ void WifiManager::loadSavedNetworks()
     // The whole app runs on a single thread (Qt event loop), so the mutex is
     // only meant to serialize file access, not for thread safety.
     m_savedSSIDs.clear();
-    QFile confFile("/etc/wpa_supplicant.conf");
+
+    // P1 Security (DR-19): defense-in-depth — verify config permissions on load.
+    // If the file is world-readable (e.g. created by an older version without
+    // chmod 0600), auto-repair it and warn.
+    const QString confPath = "/etc/wpa_supplicant.conf";
+    struct stat confStat;
+    if (::stat(confPath.toUtf8().constData(), &confStat) == 0) {
+        if (confStat.st_mode & 0077) {
+            qWarning() << "[WifiManager] Config file" << confPath
+                       << "has insecure permissions:" << QString::number(confStat.st_mode, 8)
+                       << "— auto-repairing to 0600";
+            ::chmod(confPath.toUtf8().constData(), 0600);
+        }
+    }
+
+    QFile confFile(confPath);
     if (!confFile.open(QIODevice::ReadOnly | QIODevice::Text))
         return;
 
@@ -1050,6 +1607,20 @@ void WifiManager::loadSavedNetworks()
     }
     confFile.close();
     qDebug() << "[WifiManager] Saved networks:" << m_savedSSIDs;
+}
+
+void WifiManager::resumeAutoScan()
+{
+    // Resume auto-scan after a connect attempt finishes. Called from
+    // finalizeConnectionCheck (success/fail) and onConnectTotalTimeout.
+    if (m_autoScanTimer && !m_autoScanTimer->isActive()) {
+        m_autoScanTimer->start(m_autoScanInterval);
+        qDebug() << "[WifiManager] Auto-scan resumed (interval" << m_autoScanInterval << "ms)";
+    }
+    // NOTE: No immediate scan() here — the timer fires within the interval,
+    // and scanning right after a B2K "saved network update" would double-scan
+    // (timer fires while the scan is still running, or a scan happens twice
+    // in quick succession). updateSavedFlags() already refreshes the list.
 }
 
 QString WifiManager::readSavedPassword(const QString &ssid) const
@@ -1106,8 +1677,12 @@ void WifiManager::connectSaved(const QString &ssid)
         return;
     }
     const QString password = readSavedPassword(ssid);
-    qDebug() << "[WifiManager] Connecting to saved network:" << ssid;
-    connectToNetwork(ssid, password);
+    // P0 fix (SHIFT bug): determine if the retrieved password is a hex PSK.
+    // readSavedPassword always returns either a hex PSK (64 hex chars) or empty.
+    const bool passwordIsHex = isHexPskString(password);
+    qDebug() << "[WifiManager] Connecting to saved network:" << ssid
+             << "(passwordIsHex=" << passwordIsHex << ")";
+    connectToNetwork(ssid, password, passwordIsHex);
 }
 
 void WifiManager::updateSavedFlags()
@@ -1146,7 +1721,7 @@ void WifiManager::startAutoScan()
             scan();
         });
     }
-    m_autoScanTimer->start(60000); // 60 seconds
+    m_autoScanTimer->start(m_autoScanInterval); // adaptive interval
     // Initial scan
     scan();
 }
@@ -1187,6 +1762,7 @@ void WifiManager::onInterfaceWatchdogTimeout()
         // auto-reconnect to the last known network if it's saved.
         bool wasDown = (m_watchdogDownCount >= 2);
         m_watchdogDownCount = 0; // healthy, reset debounce
+        m_recoveryAttempts = 0;  // healthy, reset recovery counter
 
         if (wasDown && !m_isConnecting) {
             if (!m_lastKnownSSID.isEmpty()) {
@@ -1256,6 +1832,50 @@ void WifiManager::onInterfaceWatchdogTimeout()
         m_scanResults.clear();
         emit scanResultsChanged();
     }
+
+    // Auto-recovery: bring the interface back up if possible.
+    // Caps at 5 attempts to avoid hammering; resets when interface recovers.
+    if (m_recoveryAttempts < 5 && !m_recoveryInProgress) {
+        startInterfaceRecovery();
+    } else if (m_recoveryAttempts >= 5 && m_watchdogDownCount % 5 == 0) {
+        qWarning() << "[WifiManager] Interface recovery exhausted after"
+                   << m_recoveryAttempts << "attempts";
+    }
+}
+
+// ==================== INTERFACE RECOVERY ====================
+
+void WifiManager::startInterfaceRecovery()
+{
+    m_recoveryInProgress = true;
+    m_recoveryAttempts++;
+
+    if (!m_recoveryProcess) {
+        m_recoveryProcess = new QProcess(this);
+        m_recoveryProcess->setProcessChannelMode(QProcess::SeparateChannels);
+        QObject::connect(m_recoveryProcess,
+                         QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                         this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+            m_recoveryInProgress = false;
+            if (exitStatus == QProcess::NormalExit && exitCode == 0) {
+                qDebug() << "[WifiManager] Recovery command ok, re-scanning";
+                if (interfaceExists() && !m_isScanning && !m_isConnecting) {
+                    scan();
+                }
+            } else {
+                qWarning() << "[WifiManager] Recovery command failed:" << exitCode << exitStatus;
+            }
+        });
+    }
+
+    // If wpa_supplicant's control socket is stale, remove it first.
+    // Then bring the interface up and restart wpa_supplicant if needed.
+    qDebug() << "[WifiManager] Interface recovery attempt" << m_recoveryAttempts;
+    m_recoveryProcess->start("sh", QStringList() << "-c"
+        << "rm -f /var/run/wpa_supplicant/wlan0; "
+           "ip link set wlan0 up 2>/dev/null; "
+           "ps | grep -q wpa_supplicant || wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf 2>/dev/null; "
+           "sleep 1; ip link set wlan0 up 2>/dev/null");
 }
 
 // ==================== TIMEOUT HANDLERS ====================
@@ -1277,7 +1897,22 @@ void WifiManager::onConnectTimeout()
 {
     if (m_isConnecting) {
         qDebug() << "[WifiManager] Connect timeout";
-        m_connectionStatus = "Connection timeout";
+        // Generate specific error message based on last observed wpa_state
+        QString errorMsg;
+        if (m_lastWpaState == "ASSOCIATING") {
+            errorMsg = QString("Cannot connect to %1 -- association failed (timeout)")
+                          .arg(m_currentSSID);
+        } else if (m_lastWpaState == "SCANNING" || m_lastWpaState == "INACTIVE") {
+            errorMsg = QString("Cannot find %1 -- network not in range")
+                          .arg(m_currentSSID);
+        } else if (m_lastWpaState == "4WAY_HANDSHAKE") {
+            errorMsg = QString("Wrong password -- authentication failed with %1")
+                          .arg(m_currentSSID);
+        } else {
+            errorMsg = QString("Cannot connect to %1 -- connection timed out")
+                          .arg(m_currentSSID);
+        }
+        m_connectionStatus = errorMsg;
         m_isConnecting = false;
         m_isConnected = false;          // Reset connected flag
         m_connectedSSID.clear();
@@ -1287,37 +1922,42 @@ void WifiManager::onConnectTimeout()
         emit connectedInfoChanged();
         stopStatusPolling(); // also stop polling
         m_connectTotalTimer.stop(); // cancel global timeout too
+        // Also set lastError for the UI error bar
+        m_lastError = errorMsg;
+        emit lastErrorChanged();
     }
 }
 
 void WifiManager::onConnectTotalTimeout()
 {
     if (m_isConnecting) {
-        qDebug() << "[WifiManager] Global connect timeout after 90s";
-        m_connectionStatus = "Connection failed";
-        m_isConnecting = false;
-        m_isConnected = false;
-        m_connectedSSID.clear();
-        m_connectedIP.clear();
-        m_renewalPending = false;
-        m_connectStep = 0;
-        m_wpaCLIBuffer.clear();
-        emit connectionStateChanged();
-        emit isConnectedChanged();
-        emit connectedInfoChanged();
-        stopStatusPolling();
-        // Kill any hung wpa_cli / dhcp / check processes
-        if (m_wpaCLIProcess->state() != QProcess::NotRunning)
-            m_wpaCLIProcess->kill();
-        if (m_dhcpProcess->state() != QProcess::NotRunning)
-            m_dhcpProcess->kill();
-        if (m_ipCheckProcess->state() != QProcess::NotRunning)
-            m_ipCheckProcess->kill();
-        if (m_ssidCheckProcess->state() != QProcess::NotRunning)
-            m_ssidCheckProcess->kill();
-        m_connectTimeoutTimer.stop();
+        // Check if this is a handshake failure (wrong password)
+        if (m_handshakeFailCount >= 3) {
+            qDebug() << "[WifiManager] Wrong password detected (handshake failed" << m_handshakeFailCount << "times)";
+            abortConnect(QString("Wrong password -- authentication failed with %1")
+                             .arg(m_currentSSID));
+        } else {
+            qDebug() << "[WifiManager] Global connect timeout after 90s";
+            // Generate specific error message based on last observed wpa_state
+            QString errorMsg;
+            if (m_lastWpaState == "ASSOCIATING") {
+                errorMsg = QString("Cannot connect to %1 -- association failed (timeout)")
+                              .arg(m_currentSSID);
+            } else if (m_lastWpaState == "SCANNING" || m_lastWpaState == "INACTIVE") {
+                errorMsg = QString("Cannot find %1 -- network not in range")
+                              .arg(m_currentSSID);
+            } else if (m_lastWpaState == "4WAY_HANDSHAKE") {
+                errorMsg = QString("Wrong password -- authentication failed with %1")
+                              .arg(m_currentSSID);
+            } else {
+                errorMsg = QString("Cannot connect to %1 -- connection timed out")
+                              .arg(m_currentSSID);
+            }
+            abortConnect(errorMsg);
+        }
     }
 }
+
 
 // ============================================================
 // STATIC HELPER FUNCTIONS — Config file
@@ -1440,7 +2080,164 @@ bool WifiManager::writeWpaSupplicantConfig(const QString &path,
         dirFile.close();
     }
 
-    qDebug() << "[WifiManager] Atomic write ok:" << path;
+    // P1 Security (DR-19): Set 0600 permissions on wpa_supplicant.conf
+    // so the hex PSK of all saved networks is only readable by root.
+    // After atomic ::rename(), the temp file's mode becomes the final
+    // file's mode. We must chmod the final path to 0600 explicitly.
+    if (::chmod(path.toUtf8().constData(), 0600) != 0) {
+        qWarning() << "[WifiManager] chmod 0600 failed on" << path
+                   << "errno:" << errno << "(" << strerror(errno) << ")";
+        // Non-fatal: config still works, but warn for defense-in-depth.
+    }
+
+    // Defense-in-depth: also chown to root:root (config is written by root app,
+    // wpa_supplicant daemon also runs as root on Luckfox Buildroot).
+    // Verify in stat check below on load.
+    const int chownResult = ::chown(path.toUtf8().constData(), 0, 0);
+    if (chownResult != 0) {
+        qWarning() << "[WifiManager] chown root:root failed on" << path
+                   << "errno:" << errno << "(" << strerror(errno) << ")";
+    }
+
+    qDebug() << "[WifiManager] Atomic write ok (0600):" << path;
+    return true;
+}
+
+// Unified teardown for failed/aborted connect flow.
+// Centralizes teardown that was previously duplicated in onStatusPollingTimeout,
+// onConnectTotalTimeout, and the config-write-failure path — including stopping
+// the global 90s timer and pausing/resuming auto-scan consistently.
+void WifiManager::abortConnect(const QString &reason)
+{
+    qDebug() << "[WifiManager] ABORT CONNECT:" << reason;
+
+    m_isConnecting = false;
+    m_isConnected = false;
+    m_connectedSSID.clear();
+    m_connectedIP.clear();
+    m_connectionStatus = reason;
+    // Set lastError for UI error bar (unless already set by more specific logic like auto-rollback)
+    if (m_lastError.isEmpty() || m_lastError == reason) {
+        m_lastError = reason;
+        emit lastErrorChanged();
+    }
+    m_connectStep = 0;
+    m_wpaCLIBuffer.clear();
+    m_renewalPending = false;
+    m_handshakeFailCount = 0;
+    m_seenFourWay = false;
+    m_fourWayConsecutive = 0;
+
+    // Clean up the temporary network entry added during the connect flow.
+    // We no longer write to disk BEFORE connect (to avoid persisting wrong
+    // passwords), so there's nothing on disk to remove. However wpa_supplicant
+    // may still have the transient network in its runtime config (added via
+    // wpa_cli add_network). Remove it to avoid accumulating stale entries
+    // in the running config over multiple failed connect attempts.
+    if (!m_pendingNetworkId.isEmpty()) {
+        qDebug() << "[WifiManager] postConnectCleanup: removing temporary network"
+                 << m_pendingNetworkId << "from wpa_supplicant runtime config";
+        QProcess::startDetached("sh", QStringList() << "-c"
+            << "wpa_cli -i wlan0 remove_network " + m_pendingNetworkId);
+        m_pendingNetworkId.clear();
+    }
+
+    stopStatusPolling();
+    m_connectTimeoutTimer.stop();
+    m_connectTotalTimer.stop();
+
+    // Kill any in-flight processes
+    if (m_wpaCLIProcess->state() != QProcess::NotRunning)
+        m_wpaCLIProcess->kill();
+    if (m_dhcpProcess->state() != QProcess::NotRunning)
+        m_dhcpProcess->kill();
+    if (m_ipCheckProcess->state() != QProcess::NotRunning)
+        m_ipCheckProcess->kill();
+    if (m_ssidCheckProcess->state() != QProcess::NotRunning)
+        m_ssidCheckProcess->kill();
+
+    emit connectionStateChanged();
+    emit isConnectedChanged();
+    emit connectedInfoChanged();
+
+    // Auto-rollback to a saved network on failure (RF-42).
+    // If we were connected to a saved network before this connect attempt,
+    // reconnect to it after 1.5s so the UI has time to show the error.
+    // If we were NOT connected this session (e.g. app just restarted and the
+    // user tapped connect before auto-connect finished, so m_previousSSID is
+    // empty), fall back to the strongest saved network currently in view.
+    QString rollbackTarget = m_previousSSID;
+    m_previousSSID.clear();
+
+    if (rollbackTarget.isEmpty()) {
+        // Not previously connected this session — pick the strongest saved
+        // network from the last scan (excluding the one we just failed on).
+        int bestSignal = -100;
+        for (const QVariant &item : m_scanResults) {
+            const QVariantMap map = item.toMap();
+            const QString s = map.value("ssid").toString();
+            const int sig = map.value("signal").toInt();
+            if (s != m_currentSSID && m_savedSSIDs.contains(s) && sig > bestSignal) {
+                bestSignal = sig;
+                rollbackTarget = s;
+            }
+        }
+        if (!rollbackTarget.isEmpty()) {
+            qDebug() << "[WifiManager] Rollback fallback: strongest saved network"
+                     << rollbackTarget << "@" << bestSignal << "dBm";
+        }
+    }
+
+    // Don't rollback if target is empty, is the network we just failed on,
+    // or is no longer saved.
+    if (!rollbackTarget.isEmpty() &&
+        rollbackTarget != m_currentSSID &&
+        m_savedSSIDs.contains(rollbackTarget)) {
+        qDebug() << "[WifiManager] Auto-rollback: reconnecting to saved network" << rollbackTarget;
+        // Set specific lastError for auto-rollback case (overrides generic reason)
+        m_lastError = "Could not connect to " + m_currentSSID
+                    + " -- rolled back to " + rollbackTarget;
+        emit lastErrorChanged();
+        QTimer::singleShot(1500, this, [this, rollbackTarget]() {
+            if (!m_isConnecting && !m_isConnected) {
+                m_connectionStatus = "Reconnecting to " + rollbackTarget;
+                emit connectionStateChanged();
+                connectSaved(rollbackTarget);
+            }
+        });
+    }
+
+    // Refresh list immediately (fixes B1/B2) and resume auto-scan
+    updateSavedFlags();
+    emit scanResultsChanged();
+    resumeAutoScan(); // connect flow over, resume auto-scan
+}
+
+// Helper: Check if a string is already a hex PSK (64 hex characters)
+bool WifiManager::isValidSSID(const QString &ssid)
+{
+    // Empty or whitespace-only SSID is invalid
+    if (ssid.trimmed().isEmpty())
+        return false;
+
+    // 802.11 SSID max is 32 bytes (octets), not characters.
+    // A multibyte UTF-8 char occupies >1 byte, so counting chars
+    // would under-report and allow an over-long UTF-8 SSID that
+    // wpa_supplicant rejects. Enforce the byte limit.
+    if (ssid.toUtf8().size() > 32)
+        return false;
+
+    // Reject control characters (newline, tab, carriage return, ESC...).
+    // A newline inside SSID would break /etc/wpa_supplicant.conf parsing
+    // (config injection). Also reject starting/ending whitespace since
+    // those confuse the UI and the sim-command splitter.
+    for (const QChar &ch : ssid) {
+        if (ch.unicode() < 0x20)
+            return false; // control char (includes \n \t \r ESC)
+    }
+    if (ssid.startsWith(' ') || ssid.endsWith(' '))
+        return false;
+
     return true;
 }
 
@@ -1520,43 +2317,3 @@ QString WifiManager::generateHexPsk(const QString &ssid, const QString &password
     return "psk=" + hexPsk;
 }
 
-// Update detailed connection status from wpa_state
-void WifiManager::updateDetailedStatus(const QString &wpaState)
-{
-    if (wpaState.isEmpty()) {
-        m_lastDetailedStatus = "Unknown";
-        emit detailedStatusChanged();
-        return;
-    }
-
-    // Map wpa_supplicant states to user-friendly descriptions
-    QString friendlyState;
-    if (wpaState == "SCANNING") {
-        friendlyState = "Scanning for networks...";
-    } else if (wpaState == "DISCONNECTED") {
-        friendlyState = "Disconnected";
-    } else if (wpaState == "INACTIVE") {
-        friendlyState = "Inactive";
-    } else if (wpaState == "INTERFACE_DISABLED") {
-        friendlyState = "Interface disabled";
-    } else if (wpaState == "ASSOCIATING") {
-        friendlyState = "Associating with access point...";
-    } else if (wpaState == "ASSOCIATED") {
-        friendlyState = "Associated, starting authentication...";
-    } else if (wpaState == "4WAY_HANDSHAKE") {
-        friendlyState = "Authenticating (4-way handshake)...";
-    } else if (wpaState == "GROUP_HANDSHAKE") {
-        friendlyState = "Completing group handshake...";
-    } else if (wpaState == "COMPLETED") {
-        friendlyState = "Connected";
-    } else if (wpaState == "DORMANT") {
-        friendlyState = "Dormant (waiting for AP)";
-    } else {
-        friendlyState = wpaState; // Fallback: show raw state
-    }
-
-    if (m_lastDetailedStatus != friendlyState) {
-        m_lastDetailedStatus = friendlyState;
-        emit detailedStatusChanged();
-    }
-}

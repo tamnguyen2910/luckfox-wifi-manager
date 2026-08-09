@@ -17,7 +17,7 @@ class WifiManager : public QObject
     Q_PROPERTY(QString connectedSSID READ connectedSSID NOTIFY connectedInfoChanged)
     Q_PROPERTY(QString connectedIP READ connectedIP NOTIFY connectedInfoChanged)
     Q_PROPERTY(QString connectionStatus READ connectionStatus NOTIFY connectionStateChanged)
-    Q_PROPERTY(QString lastDetailedStatus READ lastDetailedStatus NOTIFY detailedStatusChanged)
+    Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
     Q_PROPERTY(QVariantList scanResults READ scanResults NOTIFY scanResultsChanged)
 
 public:
@@ -30,12 +30,12 @@ public:
     QString connectedSSID() const { return m_connectedSSID; }
     QString connectedIP() const { return m_connectedIP; }
     QString connectionStatus() const { return m_connectionStatus; }
-    QString lastDetailedStatus() const { return m_lastDetailedStatus; }
+    QString lastError() const { return m_lastError; }
     QVariantList scanResults() const { return m_scanResults; }
 
     // Public slots (Q_INVOKABLE for QML)
     Q_INVOKABLE void scan();
-    Q_INVOKABLE void connectToNetwork(const QString &ssid, const QString &password);
+    Q_INVOKABLE void connectToNetwork(const QString &ssid, const QString &password, bool passwordIsHex = false);
     Q_INVOKABLE void connectSaved(const QString &ssid);
     Q_INVOKABLE void disconnectFromNetwork();
     Q_INVOKABLE void forgetNetwork(const QString &ssid);
@@ -47,7 +47,7 @@ signals:
     void isConnectedChanged();
     void connectedInfoChanged();
     void connectionStateChanged();
-    void detailedStatusChanged();
+    void lastErrorChanged();
     void scanResultsChanged();
 
 private slots:
@@ -59,6 +59,7 @@ private slots:
     void onScanTimeout();
     void onConnectTimeout();
     void onConnectTotalTimeout();
+    void onCheckTimeout(); // P1: 5s guard for ip addr show / wpa_cli status hangs
 
 private:
     struct ConfigBlock {
@@ -78,6 +79,9 @@ private:
 
     // Scan parsing
     void parseWifiScanOutput(const QString &output);
+
+    // Ensure wpa_supplicant is running (start it if the control socket is missing)
+    static void ensureWpaSupplicant();
 
     // Connection state machine helpers
     void startAddNetwork();
@@ -105,7 +109,15 @@ private:
     bool writeWpaSupplicantConfig(const QString &ssid, const QString &password);
     static QString generateHexPsk(const QString &ssid, const QString &password);
     static bool isHexPskString(const QString &str);
-    void updateDetailedStatus(const QString &wpaState);
+    static bool isValidSSID(const QString &ssid);
+
+    // Unified teardown for a failed/aborted connect flow
+    void abortConnect(const QString &reason);
+
+    // Debug: headless input simulation (reads /tmp/wifi_sim_cmd)
+    void pollSimCommands();
+    void execSimCommand(const QString &cmd);
+    void logStatus();
 
     // Status polling
     void startStatusPolling();
@@ -116,6 +128,10 @@ private:
     void startInterfaceWatchdog();
     void stopInterfaceWatchdog();
     void onInterfaceWatchdogTimeout();
+    void startInterfaceRecovery();
+
+    // Auto-scan
+    void resumeAutoScan();
 
     // Saved networks
     void loadSavedNetworks();
@@ -128,7 +144,7 @@ private:
     QString m_connectedSSID;
     QString m_connectedIP;
     QString m_connectionStatus = "Disconnected";
-    QString m_lastDetailedStatus;
+    QString m_lastError; // transient error message shown in the error bar (RF-47)
 
     // Scan related
     QVariantList m_scanResults;
@@ -149,6 +165,8 @@ private:
     QTimer m_scanTimeoutTimer;
     QTimer m_connectTimeoutTimer; // fallback path hang-guard (12s)
     QTimer m_connectTotalTimer;   // global connect timeout (90s)
+    QTimer m_checkTimeoutTimer;   // P1: 5s guard for ip addr show / wpa_cli status hangs
+    static constexpr int kCheckTimeoutMs = 5000;
     bool m_isConnecting = false;
     bool m_forgetMode = false;
     QString m_ssidToForget;
@@ -167,6 +185,11 @@ private:
     int m_renewalRetries = 0;
     void startDhcpRenewal();
 
+    // Interface recovery process (up wlan0, restart wpa_supplicant)
+    QProcess *m_recoveryProcess = nullptr;
+    int m_recoveryAttempts = 0;
+    bool m_recoveryInProgress = false;
+
     // Buffer for wpa_cli output
     QString m_wpaCLIBuffer;
 
@@ -183,11 +206,46 @@ private:
 
     // Auto scan timer
     QTimer *m_autoScanTimer = nullptr;
+    // Adaptive auto-scan (RF-03): keep the previous connected-network signal to
+    // detect stability/movement and adjust the scan interval.
+    int m_lastConnectedSignal = 0; // dBm from previous scan for connected network
+    int m_scanStableCount = 0;     // consecutive scans with stable signal (< 6 dBm change)
+    int m_autoScanInterval = 60000; // current interval (ms), 30s–180s
+
+    // Fallback: remember last good connected SSID so if a new connect attempt
+    // fails or times out, we can auto-roll back to the previous network.
+    QString m_previousSSID;       // last known good connected SSID before a new connect
+    bool m_autoRollbackPending = false;
 
     // Connection state machine
     int m_connectStep = 0; // 0=idle, 1=add_network, 2=set_ssid, 3=set_psk_or_keymgmt, 4=save_config, 5=select_network, 6=fallback_reconfigure, 7=fallback_reassociate
     QString m_pendingNetworkId;
     QString m_pendingPassword;
+    int m_flowToken = 0;   // Unique token per connect flow, prevents stale callbacks
+    bool m_passwordIsHex = false; // True when password was saved as hex PSK (from a "hex PSK" block), false when saved as plaintext (passphrase)
+    bool m_pendingPasswordWasHex = false; // Source-of-truth flag: what the USER entered (hex PSK vs passphrase)
+
+    // Handshake failure tracking (for wrong password detection).
+    // m_seenFourWay: once wpa_cli status shows 4WAY_HANDSHAKE, the next
+    // failure-state (DISCONNECTED/INACTIVE/SCANNING/ASSOCIATING) counts as one
+    // AP handshake failure. Robust against the 2s poll missing the brief
+    // 4WAY_HANDSHAKE window.
+    int m_handshakeFailCount = 0;
+    bool m_seenFourWay = false;
+    int m_fourWayConsecutive = 0; // consecutive 4WAY_HANDSHAKE polls during connect (fast wrong-password detection)
+    bool m_sawAssociating = false; // ever saw ASSOCIATING/4WAY during this connect (AP reachable → wrong password on timeout)
+    QString m_lastWpaState;   // last observed wpa_state during connecting (for specific error messages)
+    bool m_autoConnectDone = false; // startup auto-connect to strongest saved network ran (RF-04)
+
+    // Auto-rollback detection (RF-42): if during a connect the status shows
+    // COMPLETED on a DIFFERENT network than the target, wpa_supplicant already
+    // fell back to a saved network (new AP failed to associate/auth). We track
+    // consecutive polls to avoid transient false-positives during a switch.
+    QString m_otherNetworkSsid;
+    int m_otherNetworkCount = 0;
+
+    // Debug: headless input simulation poll timer
+    QTimer *m_simTimer = nullptr;
 };
 
 #endif // WIFIMANAGER_H

@@ -24,6 +24,11 @@
 | 13 | **Chống false "Connection timeout"** khi DHCP chậm (xóa timer 12s thừa) | `eeef16e` | ✅ |
 | 14 | Dọn dead code `handleDhcpRenewalFinished` | `e8904e1` | ✅ |
 | 15 | **Auto-reconnect mạng đã lưu khi khởi động** (ưu tiên "Tamnguyen", fallback mạng đầu) | `2973fe6` | ✅ |
+| 16 | **Headless input simulation + debug logging** (sim commands via `/tmp/wifi_sim_cmd`, `[ACT]/[UI]/[STA]` tagged logs) | `HEAD` | ✅ |
+| 17 | **Robust wrong-password detection** — per-AP handshake fail counting with `m_seenFourWay` guard (fixes multi-BSSID false positives) | `HEAD` | ✅ |
+| 18 | **Set_network FAIL check** in state machine (fast error on bad network id) | `HEAD` | ✅ |
+| 19 | **Unified abortConnect** — single teardown for config-fail, timeout, wrong-pwd, handshake-fail (stops timers, kills processes, resumes auto-scan) | `HEAD` | ✅ |
+| 20 | **Dead code removed** — `updateDetailedStatus` (never called, no QML binding) | `HEAD` | ✅ |
 
 ---
 
@@ -31,17 +36,20 @@
 
 ### 🔴 Ưu tiên cao (ảnh hưởng UX thực tế)
 
-- [ ] **Hiển thị lỗi sai mật khẩu**
+- [x] **Hiển thị lỗi sai mật khẩu**
   - Phân biệt "Sai mật khẩu" vs "Không tìm thấy mạng" vs "Quá xa"
   - Cách: theo dõi `wpa_state=4WAY_HANDSHAKE` lặp ≥3 lần mà không COMPLETED → "Sai mật khẩu"
   - Trạng thái `ASSOCIATING → DISCONNECTED` lặp → "Mạng quá xa / kênh nghẽn"
-- [ ] **Scan 5GHz**
-  - ⚠️ Cần kiểm tra hardware trước: `iw phy | grep -A5 Bands | grep MHz`
-  - Nếu chip chỉ 2.4GHz (RTL8188FU) → không fix được bằng phần mềm
-  - Nếu chip hỗ trợ → set regulatory domain: `iw reg set VN`
-- [ ] **WPA3 (SAE) support**
-  - Hiện tại chỉ WPA2-PSK (PBKDF2-SHA1). Mạng WPA3-only → connect fail
-  - Cần: dùng `key_mgmt=SAE` + `sae_password` khi AP chỉ WPA3, hoặc để `wpa_supplicant` auto-detect qua `ap_scan=1`
+  - ✅ **DONE:** `m_seenFourWay` guard + per-AP handshake counting + `abortConnect("Wrong password")`
+- [ ] **Scan 5GHz** — ❌ **Hardware limitation**
+  - ⚠️ Đã kiểm tra: `iw phy` chỉ hiển thị **Band 1 (2.4GHz channels 1-14)**, không có Band 2 (5GHz)
+  - Chip RV1106/WiFi module không hỗ trợ 5GHz radio — không fix được bằng phần mềm
+  - ✅ **CONFIRMED: Cannot implement**
+- [ ] **WPA3 (SAE) support** — ⚠️ **Requires Buildroot rebuild**
+  - Board's wpa_supplicant v2.6 compiled WITHOUT SAE support (verified: no SAE strings in binary)
+  - Cần: buildroot rebuild với `CONFIG_SAE=y` / `BR2_PACKAGE_WPA_SUPPLICANT_SAE=y`
+  - App-side: detect WPA3 networks từ scan output, dùng `key_mgmt=SAE` + `sae_password` khi connect
+  - Không thể test mà không rebuild wpa_supplicant trên board
 
 ### 🟡 Ưu tiên trung bình
 

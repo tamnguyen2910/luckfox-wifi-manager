@@ -7,6 +7,12 @@ ApplicationWindow {
     width: 800; height: 480; visible: true
     color: "#1a1a2e"
 
+    // [UI] log helper — pairs with the [ACT]/[SIM]/[RES] lines from C++.
+    function uiLog(msg) {
+        var t = new Date().toISOString().substr(11, 12)
+        console.log("[UI][" + t + "] " + msg)
+    }
+
     /* ===== TOP BAR ===== */
     Rectangle {
         id: topBar
@@ -83,7 +89,10 @@ ApplicationWindow {
             MouseArea {
                 id: scanMouse
                 anchors.fill: parent
-                onClicked: { if (!wifiManager.isScanning) wifiManager.scan() }
+                onClicked: {
+                    if (wifiManager.isScanning) { app.uiLog("Scan skipped — already scanning") }
+                    else { app.uiLog("Tap Scan"); wifiManager.scan() }
+                }
             }
 
             SequentialAnimation {
@@ -109,7 +118,10 @@ ApplicationWindow {
             anchors.fill: parent; color: "#b71c1c"
             Text {
                 anchors.centerIn: parent
-                text: wifiManager.connectionStatus === "Connection failed" ? "Connection failed"
+                text: wifiManager.lastError.length > 0 ? wifiManager.lastError
+                    : wifiManager.connectionStatus === "Wrong password" ? "Wrong password"
+                    : wifiManager.connectionStatus === "Invalid SSID" ? "Invalid network name"
+                    : wifiManager.connectionStatus === "Connection failed" ? "Connection failed"
                     : wifiManager.connectionStatus === "Connection timeout" ? "Connection timed out"
                     : wifiManager.connectionStatus === "Scan failed" ? "Scan failed" : "Error"
                 color: "white"; font.pixelSize: 14; font.bold: true
@@ -121,8 +133,14 @@ ApplicationWindow {
     }
     Connections {
         target: wifiManager
+        function onLastErrorChanged() {
+            if (wifiManager.lastError.length > 0) errorBar.show()
+        }
         function onConnectionStateChanged() {
-            if (wifiManager.connectionStatus === "Connection failed" ||
+            if (wifiManager.lastError.length > 0) errorBar.show()
+            else if (wifiManager.connectionStatus === "Wrong password" ||
+                wifiManager.connectionStatus === "Invalid SSID" ||
+                wifiManager.connectionStatus === "Connection failed" ||
                 wifiManager.connectionStatus === "Connection timeout" ||
                 wifiManager.connectionStatus === "Scan failed")
                 errorBar.show()
@@ -273,15 +291,15 @@ ApplicationWindow {
 
             onClicked: {
                 if (modelData.connected) {
-                    // Already connected — do nothing
+                    app.uiLog("Tap " + modelData.ssid + " — already connected")
                 } else if (modelData.saved) {
-                    // Has saved credentials — auto-connect, no password needed
+                    app.uiLog("Tap " + modelData.ssid + " — connect saved")
                     wifiManager.connectSaved(modelData.ssid)
                 } else if (modelData.secured) {
-                    passwordDialog.ssid = modelData.ssid
-                    passwordDialog.input = ""
-                    passwordDialog.visible = true
+                    app.uiLog("Tap " + modelData.ssid + " — open password dialog")
+                    passwordDialog.show(modelData.ssid, modelData.signal)
                 } else {
+                    app.uiLog("Tap " + modelData.ssid + " — connect open")
                     wifiManager.connectToNetwork(modelData.ssid, "")
                 }
             }
@@ -291,10 +309,19 @@ ApplicationWindow {
         Item {
             anchors.fill: parent
             visible: wifiManager.scanResults.length === 0 && !wifiManager.isScanning
-            Text {
+            Column {
                 anchors.centerIn: parent
-                text: "No WiFi networks found"
-                color: "#808080"; font.pixelSize: 16
+                spacing: 12
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: "No WiFi networks found"
+                    color: "#808080"; font.pixelSize: 16
+                }
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: "Tap the Scan button above to search for networks"
+                    color: "#505070"; font.pixelSize: 13
+                }
             }
         }
     }
@@ -308,6 +335,7 @@ ApplicationWindow {
         property string input: ""
         property bool showPwd: false
         property bool shiftActive: false
+        property int signal: 0          // dBm of the tapped network (for weak-signal hint)
 
         function keyPress(k) {
             if (k === "BS") { input = input.slice(0, -1) }
@@ -323,8 +351,9 @@ ApplicationWindow {
             }
         }
 
-        function show(ssid) {
+        function show(ssid, sig) {
             this.ssid = ssid;
+            this.signal = (sig !== undefined) ? sig : 0;
             input = "";
             showPwd = false;
             shiftActive = false;
@@ -365,6 +394,30 @@ ApplicationWindow {
                 anchors.horizontalCenter: parent.horizontalCenter
                 text: passwordDialog.ssid
                 color: "#e0e0e0"; font.pixelSize: 16
+            }
+
+            /* Weak-signal warning in password dialog */
+            Item {
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.horizontalCenter: parent.horizontalCenter
+                implicitWidth: 420
+                visible: passwordDialog.signal !== 0 && passwordDialog.signal < -75
+                Rectangle {
+                    anchors.fill: parent
+                    color: "#4a0000"
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Weak signal — connection may be unstable"
+                        color: "#ff4444"
+                        font.pixelSize: 12
+                    }
+                    Text {
+                        anchors.top: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter
+                        text: "Tap connect anyway to force connection"
+                        color: "#808080"
+                        font.pixelSize: 10
+                    }
+                }
             }
 
             /* Password display field */

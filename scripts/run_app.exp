@@ -1,0 +1,62 @@
+#!/usr/bin/expect -f
+# Run the WiFi Manager app on the board and show its startup log.
+# Reads board config from config/board.env (git-ignored, contains secrets).
+#
+# SECURITY (DR-06..10): StrictHostKeyChecking=no for dev convenience.
+
+set timeout 40
+
+# Parse board.env from argument
+set env_file [lindex $argv 0]
+
+if {$env_file eq ""} {
+    puts "Usage: run_app.exp <board.env>"
+    exit 1
+}
+
+# Parse key=value pairs
+set board_user ""
+set board_pass ""
+set board_ip ""
+set qt_platform ""
+set qt_fontdir ""
+set ld_lib ""
+
+set fh [open $env_file r]
+while {[gets $fh line] >= 0} {
+    if {[string match "*=*" $line]} {
+        set key [string range $line 0 [string first "=" $line]-1]
+        set val [string range $line [string first "=" $line]+1 end]
+        switch $key {
+            "BOARD_USER"      { set board_user $val }
+            "BOARD_PASS"      { set board_pass $val }
+            "BOARD_IP"        { set board_ip $val }
+            "QT_QPA_PLATFORM" { set qt_platform $val }
+            "QT_QPA_FONTDIR"  { set qt_fontdir $val }
+            "LD_LIBRARY_PATH" { set ld_lib $val }
+        }
+    }
+}
+close $fh
+
+if {$board_ip eq "" || $board_user eq ""} {
+    puts "ERR: Missing board config in $env_file"
+    exit 1
+}
+
+spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $board_user@$board_ip "
+    pkill -9 wifi-manager 2>/dev/null
+    sleep 1
+    export QT_QPA_PLATFORM='$qt_platform'
+    export QT_QPA_FONTDIR='$qt_fontdir'
+    export LD_LIBRARY_PATH='$ld_lib'
+    /root/wifi-manager > /tmp/wifiapp.log 2>&1 &
+    sleep 5
+    cat /tmp/wifiapp.log
+    echo '=== DONE ==='
+"
+expect {
+    "password:" { send "$board_pass\r"; exp_continue }
+    "=== DONE ===" { }
+    timeout { puts "TIMEOUT"; exit 1 }
+}

@@ -611,4 +611,6 @@ ApplicationWindow {
     }
 
     Component.onCompleted: wifiManager.scan()
+
+
 }
